@@ -16,6 +16,7 @@ const STEPS = [
   ["CREATED", "준비"],
   ["PHOTO_INFO_EXTRACTED", "사진 정보"],
   ["PRIVACY_REVIEWED", "민감정보"],
+  ["QUALITY_SCORED", "품질"],
   ["PHOTO_GROUPED", "그룹화"],
   ["HERO_PHOTO_SELECTED", "대표 사진"],
   ["OUTLINE_CREATED", "개요"],
@@ -29,6 +30,8 @@ const ARTIFACTS = [
   ["bundle", "Bundle"],
   ["privacy", "Privacy"],
   ["public-bundle", "Public"],
+  ["quality", "Quality"],
+  ["scored-bundle", "Scored"],
   ["grouping", "Groups"],
   ["hero", "Hero"],
   ["outline", "Outline"],
@@ -217,6 +220,7 @@ function App() {
             <div className="metrics">
               <Metric label="Photos" value={workflow?.photoCount} />
               <Metric label="Excluded" value={workflow?.privacyExcludedCount} />
+              <Metric label="Quality" value={formatScore(workflow?.averageQualityScore)} />
               <Metric label="Groups" value={workflow?.groupCount} />
               <Metric label="Heroes" value={workflow?.heroPhotoCount} />
               <Metric label="Sections" value={workflow?.outlineSectionCount} />
@@ -295,14 +299,20 @@ function currentStepIndex(status) {
   const inProgressMap = {
     PHOTO_INFO_EXTRACTING: 0,
     PRIVACY_REVIEWING: 1,
-    PHOTO_GROUPING: 2,
-    HERO_PHOTO_SELECTING: 3,
-    OUTLINE_CREATING: 4,
-    DRAFT_CREATING: 5,
-    STYLE_APPLYING: 6,
-    REVIEWING: 7,
+    QUALITY_SCORING: 2,
+    PHOTO_GROUPING: 3,
+    HERO_PHOTO_SELECTING: 4,
+    OUTLINE_CREATING: 5,
+    DRAFT_CREATING: 6,
+    STYLE_APPLYING: 7,
+    REVIEWING: 8,
   };
   return inProgressMap[status] ?? -1;
+}
+
+function formatScore(value) {
+  if (value === null || value === undefined) return undefined;
+  return Number(value).toFixed(2);
 }
 
 function formatArtifact(artifact) {
