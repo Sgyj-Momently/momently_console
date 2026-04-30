@@ -15,6 +15,7 @@ import "./styles.css";
 const STEPS = [
   ["CREATED", "준비"],
   ["PHOTO_INFO_EXTRACTED", "사진 정보"],
+  ["PRIVACY_REVIEWED", "민감정보"],
   ["PHOTO_GROUPED", "그룹화"],
   ["HERO_PHOTO_SELECTED", "대표 사진"],
   ["OUTLINE_CREATED", "개요"],
@@ -26,6 +27,8 @@ const STEPS = [
 
 const ARTIFACTS = [
   ["bundle", "Bundle"],
+  ["privacy", "Privacy"],
+  ["public-bundle", "Public"],
   ["grouping", "Groups"],
   ["hero", "Hero"],
   ["outline", "Outline"],
@@ -213,6 +216,7 @@ function App() {
             </div>
             <div className="metrics">
               <Metric label="Photos" value={workflow?.photoCount} />
+              <Metric label="Excluded" value={workflow?.privacyExcludedCount} />
               <Metric label="Groups" value={workflow?.groupCount} />
               <Metric label="Heroes" value={workflow?.heroPhotoCount} />
               <Metric label="Sections" value={workflow?.outlineSectionCount} />
@@ -290,12 +294,13 @@ function currentStepIndex(status) {
   if (exact >= 0) return exact;
   const inProgressMap = {
     PHOTO_INFO_EXTRACTING: 0,
-    PHOTO_GROUPING: 1,
-    HERO_PHOTO_SELECTING: 2,
-    OUTLINE_CREATING: 3,
-    DRAFT_CREATING: 4,
-    STYLE_APPLYING: 5,
-    REVIEWING: 6,
+    PRIVACY_REVIEWING: 1,
+    PHOTO_GROUPING: 2,
+    HERO_PHOTO_SELECTING: 3,
+    OUTLINE_CREATING: 4,
+    DRAFT_CREATING: 5,
+    STYLE_APPLYING: 6,
+    REVIEWING: 7,
   };
   return inProgressMap[status] ?? -1;
 }
@@ -318,4 +323,3 @@ async function request(url, options = {}) {
 }
 
 createRoot(document.getElementById("root")).render(<App />);
-

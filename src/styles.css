@@ -176,7 +176,7 @@ button.primary {
 .timeline {
   display: grid;
   gap: 8px;
-  grid-template-columns: repeat(9, minmax(82px, 1fr));
+  grid-template-columns: repeat(10, minmax(82px, 1fr));
 }
 
 .step {
@@ -217,7 +217,7 @@ button.primary {
 .metrics {
   display: grid;
   gap: 8px;
-  grid-template-columns: repeat(6, minmax(96px, 1fr));
+  grid-template-columns: repeat(7, minmax(96px, 1fr));
   margin-top: 14px;
 }
 
@@ -347,4 +347,3 @@ pre {
     grid-template-columns: 1fr;
   }
 }
-
