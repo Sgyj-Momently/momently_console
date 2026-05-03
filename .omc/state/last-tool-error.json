@@ -1,7 +1,0 @@
-{
-  "tool_name": "Read",
-  "tool_input_preview": "{\"file_path\":\"/Users/yeseung/Desktop/DEV/workspace/SgyjMoments/style_agent/src\"}",
-  "error": "EISDIR: illegal operation on a directory, read '/Users/yeseung/Desktop/DEV/workspace/SgyjMoments/style_agent/src'",
-  "timestamp": "2026-05-02T16:58:25.297Z",
-  "retry_count": 1
-}
