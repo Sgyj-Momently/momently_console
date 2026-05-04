@@ -1,5 +1,15 @@
 import { describe, expect, it } from "vitest";
-import { orchestratorNeedsBearer } from "./orchestratorAuth.js";
+import {
+  jwtExpired,
+  orchestratorNeedsBearer,
+  shouldClearSessionOnUnauthorized,
+} from "./orchestratorAuth.js";
+
+function fakeJwt(payload) {
+  const encode = (value) =>
+    btoa(JSON.stringify(value)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+  return `${encode({ alg: "none" })}.${encode(payload)}.sig`;
+}
 
 describe("orchestratorNeedsBearer", () => {
   const gate = "https://momently.example";
@@ -25,5 +35,28 @@ describe("orchestratorNeedsBearer", () => {
 
   it("비문자열은 false", () => {
     expect(orchestratorNeedsBearer(null)).toBe(false);
+  });
+});
+
+describe("401 세션 정리 판단", () => {
+  const now = 1_700_000_000_000;
+
+  it("만료된 JWT면 자동 세션 정리 대상", () => {
+    const token = fakeJwt({ sub: "console", exp: 1_699_999_999 });
+
+    expect(jwtExpired(token, now)).toBe(true);
+    expect(shouldClearSessionOnUnauthorized({ Authorization: `Bearer ${token}` }, now)).toBe(true);
+  });
+
+  it("아직 유효한 JWT의 401은 화면별 오류로 남기고 세션은 유지", () => {
+    const token = fakeJwt({ sub: "console", exp: 1_700_000_100 });
+
+    expect(jwtExpired(token, now)).toBe(false);
+    expect(shouldClearSessionOnUnauthorized({ Authorization: `Bearer ${token}` }, now)).toBe(false);
+  });
+
+  it("Bearer가 없거나 해석 불가한 토큰은 자동 로그아웃하지 않는다", () => {
+    expect(shouldClearSessionOnUnauthorized({}, now)).toBe(false);
+    expect(shouldClearSessionOnUnauthorized({ Authorization: "Bearer not-a-jwt" }, now)).toBe(false);
   });
 });

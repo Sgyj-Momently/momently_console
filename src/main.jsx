@@ -24,12 +24,14 @@ import {
   RefreshCw,
   Settings,
   Sparkles,
+  Trash2,
   Upload,
+  Video,
   X,
 } from "lucide-react";
 import "./styles.css";
 import { apiOriginFromEnv, voiceOriginFromEnv } from "./apiOrigin.js";
-import { orchestratorNeedsBearer } from "./orchestratorAuth.js";
+import { orchestratorNeedsBearer, shouldClearSessionOnUnauthorized } from "./orchestratorAuth.js";
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -98,8 +100,15 @@ function requestCarriesOrcAuthorization(headers) {
   return typeof raw === "string" && /^Bearer\s+\S/im.test(raw);
 }
 
+function clearExpiredSessionFromUnauthorized(headers) {
+  if (!shouldClearSessionOnUnauthorized(headers)) return false;
+  clearOrchestratorSession();
+  redirectToLoginIfNeeded();
+  return true;
+}
+
 /** 서버 업로드 API와 동일한 확장자(대소문자 무시). */
-const UPLOAD_IMAGE_EXT_RE = /\.(jpe?g|png|heic|heif|webp)$/i;
+const UPLOAD_MEDIA_EXT_RE = /\.(jpe?g|png|heic|heif|webp|mp4|mov|m4v)$/i;
 const UPLOAD_MAX_FILES = 40;
 
 const PIPELINE_STEPS = [
@@ -209,23 +218,12 @@ function saveCachedVoiceProfiles(profiles) {
   localStorage.setItem("momently_voice_profiles", JSON.stringify(profiles));
 }
 
-function loadHistory() {
+function clearHistory() {
   try {
-    return JSON.parse(localStorage.getItem("momently_history") || "[]");
+    localStorage.removeItem("momently_history");
   } catch {
-    return [];
+    //
   }
-}
-
-function addToHistory(entry) {
-  const history = loadHistory();
-  const exists = history.findIndex((h) => h.workflowId === entry.workflowId);
-  if (exists >= 0) {
-    history[exists] = { ...history[exists], ...entry };
-  } else {
-    history.unshift(entry);
-  }
-  localStorage.setItem("momently_history", JSON.stringify(history.slice(0, 50)));
 }
 
 // ── API helpers ───────────────────────────────────────────────────────────────
@@ -258,8 +256,7 @@ async function apiRequest(url, options = {}) {
   });
 
   if (response.status === 401 && needsOrcAuth && requestCarriesOrcAuthorization(headers)) {
-    clearOrchestratorSession();
-    redirectToLoginIfNeeded();
+    clearExpiredSessionFromUnauthorized(headers);
   }
 
   if (!response.ok) {
@@ -288,8 +285,7 @@ async function uploadMultipartJson(url, formData) {
   const text = await response.text();
 
   if (response.status === 401 && needsOrcAuth && requestCarriesOrcAuthorization(authHeaders ?? null)) {
-    clearOrchestratorSession();
-    redirectToLoginIfNeeded();
+    clearExpiredSessionFromUnauthorized(authHeaders);
   }
 
   if (!response.ok) {
@@ -344,12 +340,12 @@ async function loginApi(username, password) {
   return JSON.parse(text);
 }
 
-async function uploadImagesApi(files) {
+async function uploadMediaApi(files) {
   const form = new FormData();
   for (const file of files) {
     form.append("files", file);
   }
-  return uploadMultipartJson(orchPath("/api/v1/uploads/images"), form);
+  return uploadMultipartJson(orchPath("/api/v1/uploads/media"), form);
 }
 
 async function createWorkflowApi(projectId, groupingStrategy, timeWindowMinutes, voiceProfileId) {
@@ -376,8 +372,33 @@ async function fetchWorkflow(workflowId) {
   return apiRequest(orchPath(`/api/v1/workflows/${workflowId}`));
 }
 
+async function fetchWorkflows() {
+  return apiRequest(orchPath("/api/v1/workflows"));
+}
+
+async function deleteWorkflowHistoryApi() {
+  return apiRequest(orchPath("/api/v1/workflows"), {
+    method: "DELETE",
+    expectJson: false,
+  });
+}
+
 async function fetchArtifact(workflowId, type) {
   return apiRequest(orchPath(`/api/v1/workflows/${workflowId}/artifacts/${type}`));
+}
+
+async function fetchWorkflowFileBlob(workflowId, fileName) {
+  const headers = orchestratorAuthHeaders();
+  const response = await fetch(orchPath(`/api/v1/workflows/${workflowId}/files/${encodeURIComponent(fileName)}`), {
+    headers,
+  });
+  if (response.status === 401 && getAccessToken()) {
+    clearExpiredSessionFromUnauthorized(headers);
+  }
+  if (!response.ok) {
+    throw new Error(`${response.status} ${response.statusText}`);
+  }
+  return response.blob();
 }
 
 async function fetchVoiceProfilesApi() {
@@ -563,7 +584,53 @@ function LoginPage() {
 
 // ── Sub-components ────────────────────────────────────────────────────────────
 
-function MarkdownPreview({ markdown }) {
+function MarkdownImage({ workflowId, alt, fileName }) {
+  const [src, setSrc] = useState("");
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    if (!workflowId || !fileName) return undefined;
+    let cancelled = false;
+    let objectUrl = "";
+    setSrc("");
+    setError("");
+    fetchWorkflowFileBlob(workflowId, fileName)
+      .then((blob) => {
+        if (cancelled) return;
+        objectUrl = URL.createObjectURL(blob);
+        setSrc(objectUrl);
+      })
+      .catch((e) => {
+        if (!cancelled) setError(e.message);
+      });
+    return () => {
+      cancelled = true;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [workflowId, fileName]);
+
+  if (error) {
+    return <span className="image-line image-error">이미지를 불러오지 못했습니다: {fileName}</span>;
+  }
+  if (!src) {
+    return <span className="image-line">이미지 불러오는 중: {fileName}</span>;
+  }
+  return <img className="markdown-image" src={src} alt={alt || fileName} />;
+}
+
+function markdownImage(line) {
+  const match = line.match(/^!\[([^\]]*)\]\(([^)]+)\)$/);
+  if (!match) return null;
+  const rawTarget = match[2].trim();
+  if (/^https?:\/\//i.test(rawTarget) || rawTarget.startsWith("data:")) {
+    return { alt: match[1], src: rawTarget, fileName: "" };
+  }
+  const cleanTarget = rawTarget.replace(/^file:/i, "").split("#")[0].split("?")[0];
+  const fileName = cleanTarget.split(/[\\/]/).filter(Boolean).pop() || cleanTarget;
+  return { alt: match[1], fileName };
+}
+
+function MarkdownPreview({ markdown, workflowId }) {
   if (!markdown) {
     return <div className="text-muted" style={{ padding: "20px 0" }}>미리보기가 없습니다.</div>;
   }
@@ -573,7 +640,16 @@ function MarkdownPreview({ markdown }) {
         if (line.startsWith("# ")) return <h2 key={i}>{line.slice(2)}</h2>;
         if (line.startsWith("## ")) return <h3 key={i}>{line.slice(3)}</h3>;
         if (line.startsWith("- ")) return <p className="bullet" key={i}>{line}</p>;
-        if (line.startsWith("![")) return <p className="image-line" key={i}>{line}</p>;
+        if (line.startsWith("![")) {
+          const image = markdownImage(line);
+          if (!image) return <p className="image-line" key={i}>{line}</p>;
+          if (image.src) return <img className="markdown-image" key={i} src={image.src} alt={image.alt} />;
+          return (
+            <p className="image-line" key={i}>
+              <MarkdownImage workflowId={workflowId} alt={image.alt} fileName={image.fileName} />
+            </p>
+          );
+        }
         return line ? <p key={i}>{line}</p> : <br key={i} />;
       })}
     </div>
@@ -678,7 +754,7 @@ function ArtifactViewer({ workflowId, tabs = ARTIFACT_TABS }) {
                 <Loader2 className="spin" size={16} /> 불러오는 중...
               </div>
             ) : (
-              <MarkdownPreview markdown={markdown} />
+              <MarkdownPreview markdown={markdown} workflowId={workflowId} />
             )}
           </div>
         </div>
@@ -689,6 +765,130 @@ function ArtifactViewer({ workflowId, tabs = ARTIFACT_TABS }) {
           <pre>{loading ? "..." : raw || "아티팩트를 선택하면 내용이 표시됩니다."}</pre>
         </div>
       </div>
+    </div>
+  );
+}
+
+async function restyleWorkflowApi(workflowId, voiceProfileId, extraInstructions) {
+  // 202 반환 — LLM이 백그라운드에서 처리하므로 expectJson false
+  await apiRequest(orchPath(`/api/v1/workflows/${workflowId}/restyle`), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      voiceProfileId: voiceProfileId === "기본" ? null : voiceProfileId || null,
+      extraInstructions: extraInstructions || null,
+    }),
+    expectJson: false,
+  });
+}
+
+function RestylePanel({ workflowId, onRestyleComplete }) {
+  const [voiceProfiles, setVoiceProfiles] = useState(loadCachedVoiceProfiles);
+  const [selectedVoiceProfileId, setSelectedVoiceProfileId] = useState("기본");
+  const [extraInstructions, setExtraInstructions] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [statusMsg, setStatusMsg] = useState("");
+  const [error, setError] = useState("");
+  const pollRef = useRef(null);
+
+  const allVoiceProfiles = [
+    { id: "기본", name: "기본", description: "기본 warm_blog 스타일" },
+    ...BUILTIN_VOICE_PROFILES,
+    ...voiceProfiles,
+  ];
+
+  useEffect(() => {
+    fetchVoiceProfilesApi()
+      .then(setVoiceProfiles)
+      .catch(() => setVoiceProfiles(loadCachedVoiceProfiles()));
+    return () => { if (pollRef.current) clearInterval(pollRef.current); };
+  }, []);
+
+  async function handleRestyle() {
+    setBusy(true);
+    setError("");
+    setStatusMsg("요청 전송 중...");
+    try {
+      // 현재 review artifact 내용을 기준점으로 저장
+      let prevMarkdown = null;
+      try {
+        const prev = await fetchArtifact(workflowId, "review");
+        prevMarkdown = prev?.json?.final_markdown ?? prev?.text ?? null;
+      } catch { /* 무시 */ }
+
+      await restyleWorkflowApi(workflowId, selectedVoiceProfileId, extraInstructions);
+      setStatusMsg("LLM 처리 중... (수 분이 걸릴 수 있습니다)");
+
+      // 폴링 — review artifact가 바뀌면 완료로 처리 (최대 10분)
+      let attempts = 0;
+      const MAX_ATTEMPTS = 120; // 3s × 120 = 6분
+      pollRef.current = setInterval(async () => {
+        attempts++;
+        if (attempts > MAX_ATTEMPTS) {
+          clearInterval(pollRef.current);
+          setError("시간 초과: 결과를 직접 새로고침해 주세요.");
+          setBusy(false);
+          setStatusMsg("");
+          return;
+        }
+        try {
+          const next = await fetchArtifact(workflowId, "review");
+          const nextMarkdown = next?.json?.final_markdown ?? next?.text ?? null;
+          if (nextMarkdown && nextMarkdown !== prevMarkdown) {
+            clearInterval(pollRef.current);
+            setStatusMsg("문체가 다시 적용되었습니다.");
+            setBusy(false);
+            if (onRestyleComplete) onRestyleComplete(next);
+          }
+        } catch { /* 폴링 실패는 무시하고 계속 */ }
+      }, 3000);
+    } catch (e) {
+      setError(e.message);
+      setBusy(false);
+      setStatusMsg("");
+    }
+  }
+
+  return (
+    <div className="card">
+      <div className="card-title"><Palette size={14} /> 문체 다시 적용</div>
+      <div className="chip-group">
+        {allVoiceProfiles.map((profile) => (
+          <button
+            key={profile.id}
+            className={`chip ${selectedVoiceProfileId === profile.id ? "active" : ""}`}
+            onClick={() => setSelectedVoiceProfileId(profile.id)}
+            disabled={busy}
+          >
+            {profile.name}
+          </button>
+        ))}
+      </div>
+      <div className="field" style={{ marginTop: 12 }}>
+        <textarea
+          value={extraInstructions}
+          onChange={(e) => setExtraInstructions(e.target.value)}
+          placeholder="추가로 넣고 싶은 내용이나 수정 방향을 입력하세요"
+          rows={3}
+          disabled={busy}
+        />
+      </div>
+      {error && <div className="alert alert-error mt-8">{error}</div>}
+      {statusMsg && !error && (
+        <div className="flex-row text-muted mt-8" style={{ fontSize: 13 }}>
+          {busy && <Loader2 className="spin" size={13} />}
+          {statusMsg}
+        </div>
+      )}
+      <button
+        className="btn btn-primary btn-sm"
+        style={{ marginTop: 10 }}
+        onClick={handleRestyle}
+        disabled={busy}
+      >
+        {busy ? <Loader2 className="spin" size={14} /> : <RefreshCw size={14} />}
+        {busy ? "처리 중..." : "문체 다시 적용"}
+      </button>
     </div>
   );
 }
@@ -726,6 +926,7 @@ function WritePage() {
   const [workflow, setWorkflow] = useState(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [artifactKey, setArtifactKey] = useState(0);
 
   const fileInputRef = useRef(null);
   const pollRef = useRef(null);
@@ -758,12 +959,6 @@ function WritePage() {
       try {
         const data = await fetchWorkflow(wfId);
         setWorkflow(data);
-        addToHistory({
-          workflowId: data.workflowId,
-          contentType,
-          createdAt: new Date().toISOString(),
-          status: data.status,
-        });
         if (["COMPLETED", "FAILED"].includes(data.status)) {
           stopPolling();
           setPhase("done");
@@ -782,12 +977,14 @@ function WritePage() {
       const capped = [...prev];
       for (const f of list) {
         const mimeOk = typeof f.type === "string" && f.type.startsWith("image/");
-        const extOk = typeof f.name === "string" && UPLOAD_IMAGE_EXT_RE.test(f.name);
-        if (!mimeOk && !extOk) {
+        const videoMimeOk = typeof f.type === "string" && f.type.startsWith("video/");
+        const extOk = typeof f.name === "string" && UPLOAD_MEDIA_EXT_RE.test(f.name);
+        if (!mimeOk && !videoMimeOk && !extOk) {
           continue;
         }
         if (capped.length >= UPLOAD_MAX_FILES) break;
-        capped.push({ file: f, url: URL.createObjectURL(f) });
+        const kind = mimeOk || /\.(jpe?g|png|heic|heif|webp)$/i.test(f.name || "") ? "image" : "video";
+        capped.push({ file: f, url: URL.createObjectURL(f), kind });
       }
       return capped;
     });
@@ -813,25 +1010,18 @@ function WritePage() {
       let effectiveProjectId = projectId.trim();
       if (photoMode === "upload") {
         if (uploadedFiles.length === 0) {
-          setError("한 장 이상의 사진을 선택해 주세요.");
+          setError("한 개 이상의 사진 또는 동영상을 선택해 주세요.");
           setBusy(false);
           return;
         }
         const thumbnails = uploadedFiles.slice();
-        const up = await uploadImagesApi(uploadedFiles.map((entry) => entry.file));
+        const up = await uploadMediaApi(uploadedFiles.map((entry) => entry.file));
         effectiveProjectId = up.projectId;
         thumbnails.forEach((item) => URL.revokeObjectURL(item.url));
         setUploadedFiles([]);
       }
 
       const wf = await createWorkflowApi(effectiveProjectId, groupingStrategy, timeWindowMinutes, selectedVoiceProfileId);
-      addToHistory({
-        workflowId: wf.workflowId,
-        contentType,
-        voiceProfileId: selectedVoiceProfileId,
-        createdAt: new Date().toISOString(),
-        status: wf.status,
-      });
       await runWorkflowApi(wf.workflowId);
       const updated = await fetchWorkflow(wf.workflowId);
       setWorkflow(updated);
@@ -885,12 +1075,18 @@ function WritePage() {
         </div>
 
         {phase === "done" && workflow?.status === "COMPLETED" && (
-          <div className="card">
-            <div className="card-title">
-              <FileText size={14} /> 결과물
+          <>
+            <div className="card">
+              <div className="card-title">
+                <FileText size={14} /> 결과물
+              </div>
+              <ArtifactViewer key={artifactKey} workflowId={workflow.workflowId} tabs={ARTIFACT_TABS} />
             </div>
-            <ArtifactViewer workflowId={workflow.workflowId} tabs={ARTIFACT_TABS} />
-          </div>
+            <RestylePanel
+              workflowId={workflow.workflowId}
+              onRestyleComplete={() => setArtifactKey((k) => k + 1)}
+            />
+          </>
         )}
 
         {phase === "done" && workflow?.status === "FAILED" && (
@@ -909,15 +1105,15 @@ function WritePage() {
   return (
     <div className="page">
       <title>새 글 쓰기 | Momently</title>
-      <meta name="description" content="사진을 업로드하고 AI가 블로그 글을 자동으로 작성합니다." />
+      <meta name="description" content="사진과 동영상을 업로드하고 AI가 블로그 글을 자동으로 작성합니다." />
       <div className="page-header">
         <h2>새 글 쓰기</h2>
-        <p>사진과 콘텐츠 유형을 선택하고 AI가 블로그 글을 작성합니다.</p>
+        <p>사진·동영상과 콘텐츠 유형을 선택하고 AI가 블로그 글을 작성합니다.</p>
       </div>
 
       {/* Photo section */}
       <div className="card">
-        <div className="card-title"><Image size={14} /> 사진</div>
+        <div className="card-title"><Image size={14} /> 미디어</div>
         <div className="mode-toggle">
           <button
             className={photoMode === "id" ? "active" : ""}
@@ -953,13 +1149,13 @@ function WritePage() {
               onClick={() => fileInputRef.current?.click()}
             >
               <Upload size={28} color="#8aa898" />
-              <p>사진을 드래그하거나 클릭해서 선택하세요</p>
-              <span>JPG · PNG · WEBP · HEIC/HEIF 지원 (최대 {UPLOAD_MAX_FILES}장)</span>
+              <p>사진이나 동영상을 드래그하거나 클릭해서 선택하세요</p>
+              <span>JPG · PNG · WEBP · HEIC/HEIF · MP4 · MOV · M4V 지원 (최대 {UPLOAD_MAX_FILES}개)</span>
             </div>
             <input
               ref={fileInputRef}
               type="file"
-              accept=".jpg,.jpeg,.png,.webp,.heic,.heif,image/*"
+              accept=".jpg,.jpeg,.png,.webp,.heic,.heif,.mp4,.mov,.m4v,image/*,video/*"
               multiple
               style={{ display: "none" }}
               onChange={(e) => handleFiles(e.target.files)}
@@ -968,7 +1164,14 @@ function WritePage() {
               <div className="photo-thumbs">
                 {uploadedFiles.map((item, i) => (
                   <div key={i} className="photo-thumb">
-                    <img src={item.url} alt="" />
+                    {item.kind === "image" ? (
+                      <img src={item.url} alt="" />
+                    ) : (
+                      <div className="video-thumb">
+                        <Video size={22} />
+                        <span>{item.file.name}</span>
+                      </div>
+                    )}
                     <button
                       className="photo-thumb-remove"
                       onClick={(e) => { e.stopPropagation(); removePhoto(i); }}
@@ -980,8 +1183,8 @@ function WritePage() {
               </div>
             )}
             <p className="text-muted mt-8" style={{ fontSize: 12, lineHeight: 1.55 }}>
-              서버에 올린 뒤 자동으로 새 프로젝트 ID가 만들어지며, 사진은 설정된 입력 폴더에만 저장됩니다.
-              한 장당 최대 25MB, 전체 최대 약 120MB(스프링 설정 기준)까지입니다. 업로드 API는 로그인(JWT) 후에만
+              서버에 올린 뒤 자동으로 새 프로젝트 ID가 만들어지며, 미디어는 설정된 입력 폴더에만 저장됩니다.
+              파일당 최대 25MB, 전체 최대 약 120MB(스프링 설정 기준)까지입니다. 업로드 API는 로그인(JWT) 후에만
               호출됩니다.
             </p>
           </>
@@ -1432,11 +1635,47 @@ function TonePage() {
 const HISTORY_WORKFLOW_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function HistoryPage() {
-  const [history] = useState(loadHistory);
+  const [history, setHistory] = useState([]);
   const [selected, setSelected] = useState(null);
   const [workflow, setWorkflow] = useState(null);
+  const [loadingHistory, setLoadingHistory] = useState(true);
+  const [historyError, setHistoryError] = useState("");
   const [loadingDetail, setLoadingDetail] = useState(false);
   const [detailError, setDetailError] = useState("");
+  const [historyArtifactKey, setHistoryArtifactKey] = useState(0);
+
+  async function loadServerHistory() {
+    setLoadingHistory(true);
+    setHistoryError("");
+    try {
+      const data = await fetchWorkflows();
+      setHistory(Array.isArray(data) ? data : []);
+      clearHistory();
+    } catch (e) {
+      setHistoryError(e.message);
+      setHistory([]);
+    } finally {
+      setLoadingHistory(false);
+    }
+  }
+
+  useEffect(() => {
+    loadServerHistory();
+  }, []);
+
+  async function clearAllHistory() {
+    setHistoryError("");
+    try {
+      await deleteWorkflowHistoryApi();
+      clearHistory();
+      setHistory([]);
+      setSelected(null);
+      setWorkflow(null);
+      setDetailError("");
+    } catch (e) {
+      setHistoryError(e.message);
+    }
+  }
 
   async function openItem(item) {
     setSelected(item);
@@ -1473,7 +1712,7 @@ function HistoryPage() {
                 {selected.workflowId}
               </h2>
               <p>
-                {selected.contentType} &middot; {formatDate(selected.createdAt)}
+                {selected.projectId || selected.contentType || "워크플로"} &middot; {selected.groupingStrategy || "-"}
               </p>
             </div>
             {workflow && <StatusPill status={workflow.status} />}
@@ -1497,17 +1736,24 @@ function HistoryPage() {
             </div>
 
             {["COMPLETED"].includes(workflow.status) && (
-              <div className="card">
-                <div className="card-title"><FileText size={14} /> 결과물</div>
-                <ArtifactViewer
+              <>
+                <div className="card">
+                  <div className="card-title"><FileText size={14} /> 결과물</div>
+                  <ArtifactViewer
+                    key={historyArtifactKey}
+                    workflowId={workflow.workflowId}
+                    tabs={[
+                      ["review", "최종 블로그"],
+                      ["style", "문체 적용"],
+                      ["draft", "초안"],
+                    ]}
+                  />
+                </div>
+                <RestylePanel
                   workflowId={workflow.workflowId}
-                  tabs={[
-                    ["review", "최종 블로그"],
-                    ["style", "문체 적용"],
-                    ["draft", "초안"],
-                  ]}
+                  onRestyleComplete={() => setHistoryArtifactKey((k) => k + 1)}
                 />
-              </div>
+              </>
             )}
           </>
         )}
@@ -1520,11 +1766,26 @@ function HistoryPage() {
       <title>작업 기록 | Momently</title>
       <meta name="description" content="이전에 생성한 블로그 글 작업 기록을 확인합니다." />
       <div className="page-header">
-        <h2>작업 기록</h2>
-        <p>이전에 실행한 글쓰기 작업 목록입니다.</p>
+        <div className="history-header">
+          <div>
+            <h2>작업 기록</h2>
+            <p>이전에 실행한 글쓰기 작업 목록입니다.</p>
+          </div>
+          {history.length > 0 && (
+            <button type="button" className="btn btn-ghost btn-sm" onClick={clearAllHistory}>
+              <Trash2 size={14} /> 전체 삭제
+            </button>
+          )}
+        </div>
       </div>
 
-      {history.length === 0 ? (
+      {historyError && <div className="alert alert-error">{historyError}</div>}
+
+      {loadingHistory ? (
+        <div className="flex-row text-muted">
+          <Loader2 className="spin" size={16} /> 불러오는 중...
+        </div>
+      ) : history.length === 0 ? (
         <div className="history-empty">
           아직 작업 기록이 없습니다. 새 글 쓰기 페이지에서 시작해보세요.
         </div>
@@ -1542,7 +1803,7 @@ function HistoryPage() {
               <div className="history-item-info">
                 <div className="history-item-id">{item.workflowId}</div>
                 <div className="history-item-meta">
-                  {item.contentType} &middot; {formatDate(item.createdAt)}
+                  {item.projectId || item.contentType || "워크플로"} &middot; {item.groupingStrategy || "-"}
                 </div>
               </div>
               <StatusPill status={item.status ?? "UNKNOWN"} />
@@ -1735,7 +1996,7 @@ function MonitorPage() {
             <div className="artifact-pane">
               <div className="artifact-pane-header"><Image size={13} /> Preview</div>
               <div className="artifact-pane markdown-wrap">
-                <MarkdownPreview markdown={markdown} />
+                <MarkdownPreview markdown={markdown} workflowId={workflowId} />
               </div>
             </div>
             <div className="artifact-pane">
