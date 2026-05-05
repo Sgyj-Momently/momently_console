@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   createBrowserRouter,
@@ -32,6 +32,7 @@ import {
 import "./styles.css";
 import { apiOriginFromEnv, voiceOriginFromEnv } from "./apiOrigin.js";
 import { orchestratorNeedsBearer, shouldClearSessionOnUnauthorized } from "./orchestratorAuth.js";
+import VoiceSampleEditor from "./VoiceSampleEditor.jsx";
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -105,6 +106,36 @@ function clearExpiredSessionFromUnauthorized(headers) {
   clearOrchestratorSession();
   redirectToLoginIfNeeded();
   return true;
+}
+
+function parseErrorDetail(text) {
+  if (!text) return "";
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed?.error && typeof parsed.error === "string") return parsed.error;
+    if (parsed?.message && typeof parsed.message === "string") return parsed.message;
+    if (parsed?.detail && typeof parsed.detail === "string") return parsed.detail;
+  } catch {
+    //
+  }
+  return text;
+}
+
+function httpErrorMessage(response, detail) {
+  const suffix = detail ? `: ${detail}` : "";
+  if (response.status === 401) {
+    return `로그인이 필요하거나 세션이 만료되었습니다. 다시 로그인해 주세요.${suffix}`;
+  }
+  if (response.status === 403) {
+    return `접근 권한이 없습니다. 로그인 계정과 게이트 설정을 확인해 주세요.${suffix}`;
+  }
+  if (response.status === 404) {
+    return `요청한 리소스를 찾을 수 없습니다.${suffix}`;
+  }
+  if (response.status >= 500) {
+    return `서버 처리 중 오류가 발생했습니다.${suffix}`;
+  }
+  return `${response.status} ${response.statusText}${suffix}`;
 }
 
 /** 서버 업로드 API와 동일한 확장자(대소문자 무시). */
@@ -250,10 +281,16 @@ async function apiRequest(url, options = {}) {
     }
   }
 
-  const response = await fetch(url, {
-    ...fetchOptions,
-    ...(headers !== undefined ? { headers } : {}),
-  });
+  let response;
+  try {
+    response = await fetch(url, {
+      ...fetchOptions,
+      ...(headers !== undefined ? { headers } : {}),
+    });
+  } catch (err) {
+    console.error("[Momently] API 요청 실패:", url, err);
+    throw new Error("서버에 연결하지 못했습니다. 게이트와 오케스트레이터 상태를 확인해 주세요.");
+  }
 
   if (response.status === 401 && needsOrcAuth && requestCarriesOrcAuthorization(headers)) {
     clearExpiredSessionFromUnauthorized(headers);
@@ -261,11 +298,12 @@ async function apiRequest(url, options = {}) {
 
   if (!response.ok) {
     const body = await response.text();
-    throw new Error(`${response.status} ${response.statusText}${body ? `: ${body}` : ""}`);
+    throw new Error(httpErrorMessage(response, parseErrorDetail(body)));
   }
   if (!expectJson || response.status === 202 || response.status === 204) return null;
   const data = await response.json();
-  return data.content ?? data;
+  // JSON 이 null 이거나 본문이 비어 있을 때 data.content 접근으로 TypeError 나는 것을 막는다.
+  return data?.content ?? data;
 }
 
 /**
@@ -368,12 +406,101 @@ async function runWorkflowApi(workflowId) {
   });
 }
 
+async function retryWorkflowApi(workflowId) {
+  return apiRequest(orchPath(`/api/v1/workflows/${workflowId}/retry`), {
+    method: "POST",
+    expectJson: false,
+  });
+}
+
 async function fetchWorkflow(workflowId) {
   return apiRequest(orchPath(`/api/v1/workflows/${workflowId}`));
 }
 
+function workflowFromEventPayload(payload) {
+  if (!payload || typeof payload !== "object") return null;
+  return {
+    workflowId: payload.workflowId,
+    projectId: payload.projectId,
+    status: payload.status,
+    photoCount: payload.photoCount,
+    privacyExcludedCount: payload.privacyExcludedCount,
+    averageQualityScore: payload.averageQualityScore,
+    groupCount: payload.groupCount,
+    heroPhotoCount: payload.heroPhotoCount,
+    outlineSectionCount: payload.outlineSectionCount,
+    draftSectionCount: payload.draftSectionCount,
+    styledWordCount: payload.styledWordCount,
+    reviewIssueCount: payload.reviewIssueCount,
+    lastFailedStep: payload.lastFailedStep,
+    lastErrorMessage: payload.lastErrorMessage,
+  };
+}
+
+function startWorkflowEventStream(workflowId, onWorkflow, onError) {
+  const controller = new AbortController();
+  const headers = orchestratorAuthHeaders({ Accept: "text/event-stream" });
+
+  function handleBlock(block) {
+    const data = block
+      .split(/\r?\n/)
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice(5).trimStart())
+      .join("\n")
+      .trim();
+    if (!data) return;
+    const workflow = workflowFromEventPayload(JSON.parse(data));
+    if (workflow) onWorkflow(workflow);
+  }
+
+  (async () => {
+    const response = await fetch(orchPath(`/api/v1/workflows/${workflowId}/events`), {
+      headers,
+      signal: controller.signal,
+    });
+    if (response.status === 401 && requestCarriesOrcAuthorization(headers)) {
+      clearExpiredSessionFromUnauthorized(headers);
+    }
+    if (!response.ok) {
+      const body = await response.text();
+      throw new Error(httpErrorMessage(response, parseErrorDetail(body)));
+    }
+    if (!response.body) {
+      throw new Error("SSE 스트림을 열 수 없습니다.");
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const blocks = buffer.split(/\r?\n\r?\n/);
+      buffer = blocks.pop() ?? "";
+      blocks.forEach(handleBlock);
+    }
+    if (buffer.trim()) handleBlock(buffer);
+  })().catch((error) => {
+    if (!controller.signal.aborted) onError(error);
+  });
+
+  return () => controller.abort();
+}
+
 async function fetchWorkflows() {
-  return apiRequest(orchPath("/api/v1/workflows"));
+  const data = await apiRequest(orchPath("/api/v1/workflows"));
+  if (Array.isArray(data)) return data;
+  if (Array.isArray(data?.workflows)) return data.workflows;
+  if (Array.isArray(data?._embedded?.workflows)) return data._embedded.workflows;
+  if (data && typeof data === "object") {
+    const embedded = data._embedded;
+    if (embedded && typeof embedded === "object") {
+      const firstArray = Object.values(embedded).find((v) => Array.isArray(v));
+      if (firstArray) return firstArray;
+    }
+  }
+  return [];
 }
 
 async function deleteWorkflowHistoryApi() {
@@ -460,6 +587,189 @@ function extractMarkdown(artifact) {
   return artifact?.json?.final_markdown || artifact?.json?.markdown || artifact?.text || "";
 }
 
+/** 서버가 보내는 워크플로 상태 → 사용자에게 보여 줄 현재 단계 설명 */
+const PIPELINE_LIVE_CAPTIONS = {
+  CREATED: "워크플로가 준비됐습니다. 실행을 시작하면 파이프라인이 돌아갑니다.",
+  PHOTO_INFO_EXTRACTING: "사진·동영상을 읽고, EXIF·썸네일·LLM 비전으로 장면마다 요약하는 중입니다.",
+  PRIVACY_REVIEWING: "민감 정보(얼굴·번호판 등)를 검사하고 안전한 사진만 남기는 중입니다.",
+  QUALITY_SCORING: "품질 점수를 매기고, 이후 단계에 넘길 사진을 고르는 중입니다.",
+  PHOTO_GROUPING: "시간·장소 기준으로 사진 묶음(그룹)을 만드는 중입니다.",
+  HERO_PHOTO_SELECTING: "각 그룹에서 대표 사진을 고르는 중입니다.",
+  OUTLINE_CREATING: "글의 목차(섹션 구조)를 짜는 중입니다.",
+  DRAFT_CREATING: "목차에 맞춰 초안 문단을 쓰는 중입니다.",
+  STYLE_APPLYING: "선택한 말투로 문장을 다듬는 중입니다.",
+  REVIEWING: "검수 에이전트가 톤·사실·형식을 점검하는 중입니다.",
+};
+
+function pipelineLiveCaption(status) {
+  if (PIPELINE_LIVE_CAPTIONS[status]) return PIPELINE_LIVE_CAPTIONS[status];
+  const i = currentStepIndex(status);
+  if (i >= 0 && PIPELINE_STEPS[i]) {
+    return `「${PIPELINE_STEPS[i][1]}」 단계까지 완료됐습니다. 다음 단계를 기다리는 중입니다.`;
+  }
+  return "파이프라인 상태를 불러오는 중입니다.";
+}
+
+/** 줄 단위 LCS 기반 diff (문체 재적용 후 어디가 바뀌었는지 표시용) */
+function diffLinesByLcs(oldText, newText) {
+  const a = oldText === "" ? [] : oldText.split("\n");
+  const b = newText === "" ? [] : newText.split("\n");
+  const m = a.length;
+  const n = b.length;
+  const dp = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+  for (let i = m - 1; i >= 0; i--) {
+    for (let j = n - 1; j >= 0; j--) {
+      dp[i][j] = a[i] === b[j] ? 1 + dp[i + 1][j + 1] : Math.max(dp[i + 1][j], dp[i][j + 1]);
+    }
+  }
+  const segments = [];
+  let i = 0;
+  let j = 0;
+  while (i < m && j < n) {
+    if (a[i] === b[j]) {
+      segments.push({ type: "same", text: a[i] });
+      i++;
+      j++;
+    } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+      segments.push({ type: "remove", text: a[i] });
+      i++;
+    } else {
+      segments.push({ type: "add", text: b[j] });
+      j++;
+    }
+  }
+  while (i < m) {
+    segments.push({ type: "remove", text: a[i] });
+    i++;
+  }
+  while (j < n) {
+    segments.push({ type: "add", text: b[j] });
+    j++;
+  }
+  return segments;
+}
+
+function PipelineLiveRail({ status }) {
+  if (status === "COMPLETED" || status === "FAILED") return null;
+  return (
+    <div className="pipeline-live-rail" aria-live="polite">
+      <div className="pipeline-indeterminate-track" aria-hidden>
+        <div className="pipeline-indeterminate-bar" />
+      </div>
+      <p className="pipeline-live-caption">{pipelineLiveCaption(status)}</p>
+    </div>
+  );
+}
+
+const RESTYLE_HINT_ROTATION_MS = 2800;
+const RESTYLE_STAGE_HINTS = [
+  "스타일 에이전트가 초안 마크다운을 읽고, 말투 규칙에 맞게 문장을 바꿉니다.",
+  "검수 에이전트가 톤·반복·어색한 표현을 다시 점검합니다.",
+  "LLM 호출이므로 수 분 걸릴 수 있습니다. 아래 미리보기에서 진행 상황을 표시합니다.",
+];
+
+function RestyleScanningPreview({ markdown, workflowId, active }) {
+  return (
+    <div className={`restyle-scan-wrap ${active ? "restyle-scan-wrap--active" : ""}`}>
+      <div className="restyle-scan-shimmer" aria-hidden />
+      <div className="restyle-scan-content">
+        <MarkdownPreview markdown={markdown || " "} workflowId={workflowId} />
+      </div>
+    </div>
+  );
+}
+
+function RestyleCrossfadePreview({ workflowId, fromMd, toMd, durationMs, onComplete }) {
+  const [progress, setProgress] = useState(0);
+  const doneRef = useRef(false);
+  const onCompleteRef = useRef(onComplete);
+  onCompleteRef.current = onComplete;
+
+  useEffect(() => {
+    doneRef.current = false;
+    const start = performance.now();
+    let frame;
+    const tick = (now) => {
+      const p = Math.min(1, (now - start) / durationMs);
+      setProgress(p);
+      if (p < 1) {
+        frame = requestAnimationFrame(tick);
+      } else if (!doneRef.current) {
+        doneRef.current = true;
+        onCompleteRef.current?.();
+      }
+    };
+    frame = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(frame);
+  }, [fromMd, toMd, durationMs]);
+
+  const topOp = 1 - progress;
+  const botOp = progress;
+  return (
+    <div className="restyle-crossfade">
+      <div className="restyle-crossfade-layer" style={{ gridArea: "1 / 1", opacity: topOp }}>
+        <MarkdownPreview markdown={fromMd || " "} workflowId={workflowId} />
+      </div>
+      <div
+        className="restyle-crossfade-layer restyle-crossfade-layer--new"
+        style={{ gridArea: "1 / 1", opacity: botOp }}
+      >
+        <MarkdownPreview markdown={toMd || " "} workflowId={workflowId} />
+      </div>
+    </div>
+  );
+}
+
+function RestyleDiffPanel({ oldText, newText }) {
+  const [open, setOpen] = useState(true);
+  const segments = diffLinesByLcs(oldText ?? "", newText ?? "");
+  const addN = segments.filter((s) => s.type === "add").length;
+  const delN = segments.filter((s) => s.type === "remove").length;
+  if (addN === 0 && delN === 0) {
+    return (
+      <div className="restyle-diff-panel restyle-diff-panel--empty">
+        줄 단위로는 동일하게 보입니다. (표현·띄어쓰기 등 미세한 차이는 있을 수 있습니다.)
+      </div>
+    );
+  }
+  return (
+    <div className="restyle-diff-panel">
+      <button type="button" className="restyle-diff-toggle" onClick={() => setOpen(!open)}>
+        {open ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
+        변경 줄 보기
+        <span className="restyle-diff-badge">
+          +{addN} / −{delN}
+        </span>
+      </button>
+      {open && (
+        <div className="restyle-diff-lines">
+          {segments.map((seg, idx) => {
+            if (seg.type === "same") {
+              return (
+                <pre key={`s-${idx}-${seg.text?.slice(0, 12)}`} className="restyle-diff-line restyle-diff-line--same">
+                  {seg.text}
+                </pre>
+              );
+            }
+            if (seg.type === "remove") {
+              return (
+                <pre key={`r-${idx}`} className="restyle-diff-line restyle-diff-line--remove">
+                  − {seg.text}
+                </pre>
+              );
+            }
+            return (
+              <pre key={`a-${idx}`} className="restyle-diff-line restyle-diff-line--add">
+                + {seg.text}
+              </pre>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function formatDate(iso) {
   if (!iso) return "";
   try {
@@ -467,6 +777,35 @@ function formatDate(iso) {
   } catch {
     return iso;
   }
+}
+
+function formatBytes(bytes) {
+  if (!Number.isFinite(bytes)) return "";
+  if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))}KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)}MB`;
+}
+
+function workflowStatusLabel(status) {
+  if (!status || status === "IDLE") return "대기";
+  if (status === "COMPLETED") return "완료";
+  if (status === "FAILED") return "실패";
+  if (status === "CREATED") return "준비됨";
+  const activeIndex = IN_PROGRESS_MAP[status];
+  if (activeIndex !== undefined) return `${PIPELINE_STEPS[activeIndex]?.[1] ?? "처리"} 중`;
+  const exact = PIPELINE_STEPS.find((step) => step[0] === status);
+  return exact ? `${exact[1]} 완료` : status;
+}
+
+function workflowTitle(workflow) {
+  if (!workflow) return "글쓰기 작업";
+  return workflow.projectId || workflow.contentType || "글쓰기 작업";
+}
+
+function mediaSummary(files) {
+  const images = files.filter((item) => item.kind === "image").length;
+  const videos = files.filter((item) => item.kind === "video").length;
+  const totalBytes = files.reduce((sum, item) => sum + (item.file?.size || 0), 0);
+  return { images, videos, totalBytes };
 }
 
 // ── Auth shell ─────────────────────────────────────────────────────────────────
@@ -656,23 +995,30 @@ function MarkdownPreview({ markdown, workflowId }) {
   );
 }
 
-function PipelineSteps({ status }) {
+function PipelineSteps({ status, showActivityRail = false }) {
   const doneIndex = currentStepIndex(status);
+  const rail =
+    showActivityRail && status !== "COMPLETED" && status !== "FAILED" ? (
+      <PipelineLiveRail status={status} />
+    ) : null;
   return (
-    <div className="pipeline-steps">
-      {PIPELINE_STEPS.map(([key, label], i) => {
-        const done = i < doneIndex || key === status;
-        const active = isActiveStep(status, i);
-        const cls = done ? "done" : active ? "active" : "pending";
-        return (
-          <div key={key} className={`pipeline-step ${cls}`}>
-            <div className={`step-dot ${cls}`}>
-              {done && <Check size={11} strokeWidth={3} />}
+    <div className="pipeline-steps-wrapper">
+      <div className="pipeline-steps">
+        {PIPELINE_STEPS.map(([key, label], i) => {
+          const done = i < doneIndex || key === status;
+          const active = isActiveStep(status, i);
+          const cls = done ? "done" : active ? "active" : "pending";
+          return (
+            <div key={key} className={`pipeline-step ${cls}`}>
+              <div className={`step-dot ${cls}`}>
+                {done && <Check size={11} strokeWidth={3} />}
+              </div>
+              <div className="step-label">{label}</div>
             </div>
-            <div className="step-label">{label}</div>
-          </div>
-        );
-      })}
+          );
+        })}
+      </div>
+      {rail}
     </div>
   );
 }
@@ -789,7 +1135,16 @@ function RestylePanel({ workflowId, onRestyleComplete }) {
   const [busy, setBusy] = useState(false);
   const [statusMsg, setStatusMsg] = useState("");
   const [error, setError] = useState("");
+  const [appliedMeta, setAppliedMeta] = useState("");
   const pollRef = useRef(null);
+  const hintTimerRef = useRef(null);
+  const [pollTick, setPollTick] = useState(0);
+  const [hintIndex, setHintIndex] = useState(0);
+  /** idle | polling | fade | summary */
+  const [visualPhase, setVisualPhase] = useState("idle");
+  const [baselineMd, setBaselineMd] = useState("");
+  const [fadeFrom, setFadeFrom] = useState("");
+  const [fadeTo, setFadeTo] = useState("");
 
   const allVoiceProfiles = [
     { id: "기본", name: "기본", description: "기본 warm_blog 스타일" },
@@ -801,53 +1156,170 @@ function RestylePanel({ workflowId, onRestyleComplete }) {
     fetchVoiceProfilesApi()
       .then(setVoiceProfiles)
       .catch(() => setVoiceProfiles(loadCachedVoiceProfiles()));
-    return () => { if (pollRef.current) clearInterval(pollRef.current); };
+    return () => {
+      if (pollRef.current) {
+        if (typeof pollRef.current === "function") {
+          pollRef.current();
+        } else {
+          clearInterval(pollRef.current);
+        }
+      }
+      if (hintTimerRef.current) clearInterval(hintTimerRef.current);
+    };
   }, []);
 
+  useEffect(() => {
+    if (visualPhase !== "polling") {
+      if (hintTimerRef.current) clearInterval(hintTimerRef.current);
+      hintTimerRef.current = null;
+      return undefined;
+    }
+    hintTimerRef.current = setInterval(() => {
+      setHintIndex((i) => (i + 1) % RESTYLE_STAGE_HINTS.length);
+    }, RESTYLE_HINT_ROTATION_MS);
+    return () => {
+      if (hintTimerRef.current) clearInterval(hintTimerRef.current);
+    };
+  }, [visualPhase]);
+
+  const handleFadeDone = useCallback(() => {
+    setVisualPhase("summary");
+    setStatusMsg("문체가 다시 적용되었습니다.");
+    setBusy(false);
+    if (onRestyleComplete) onRestyleComplete();
+  }, [onRestyleComplete]);
+
   async function handleRestyle() {
+    const chosenVoiceProfileId = selectedVoiceProfileId;
     setBusy(true);
     setError("");
+    setAppliedMeta("");
+    setVisualPhase("polling");
+    setPollTick(0);
+    setHintIndex(0);
+    setFadeTo("");
     setStatusMsg("요청 전송 중...");
     try {
-      // 현재 review artifact 내용을 기준점으로 저장
-      let prevMarkdown = null;
+      let prevMarkdown = "";
       try {
         const prev = await fetchArtifact(workflowId, "review");
-        prevMarkdown = prev?.json?.final_markdown ?? prev?.text ?? null;
-      } catch { /* 무시 */ }
+        prevMarkdown = prev?.json?.final_markdown ?? prev?.text ?? "";
+      } catch {
+        prevMarkdown = "";
+      }
+      setBaselineMd(prevMarkdown);
+      setFadeFrom(prevMarkdown);
 
-      await restyleWorkflowApi(workflowId, selectedVoiceProfileId, extraInstructions);
-      setStatusMsg("LLM 처리 중... (수 분이 걸릴 수 있습니다)");
+      await restyleWorkflowApi(workflowId, chosenVoiceProfileId, extraInstructions);
+      setStatusMsg(`서버에서 문체·검수를 다시 실행하는 중입니다. (선택: ${chosenVoiceProfileId})`);
 
-      // 폴링 — review artifact가 바뀌면 완료로 처리 (최대 10분)
+      const MAX_ATTEMPTS = 120;
       let attempts = 0;
-      const MAX_ATTEMPTS = 120; // 3s × 120 = 6분
-      pollRef.current = setInterval(async () => {
+
+      const finishWithArtifacts = async ({ allowSameMarkdown = false } = {}) => {
+        // 1) 스타일 아티팩트에서 실제로 어떤 voice_profile_id가 적용됐는지 먼저 확인(“적용 안 됐다” 오해 방지)
+        try {
+          const styled = await fetchArtifact(workflowId, "style");
+          const vid = styled?.json?.voice_profile_id;
+          const summary = styled?.json?.voice_profile_summary;
+          if (vid) {
+            setAppliedMeta(`적용된 말투: ${vid}${summary ? ` · ${String(summary).slice(0, 120)}` : ""}`);
+          } else if (chosenVoiceProfileId && chosenVoiceProfileId !== "기본") {
+            setAppliedMeta("주의: 스타일 결과에 voice_profile_id가 없어 기본 문체로 처리됐을 수 있습니다.");
+          }
+        } catch {
+          // ignore
+        }
+
+        // 2) 리뷰(최종) 마크다운을 가져와서 “적용 전/후”를 보여준다.
+        const next = await fetchArtifact(workflowId, "review");
+        const nextMarkdown = next?.json?.final_markdown ?? next?.text ?? null;
+        if (nextMarkdown == null) return false;
+
+        // 내용이 아주 비슷하면 diff가 거의 없을 수 있음. 그래도 “완료/적용됨”은 표시한다.
+        if (!allowSameMarkdown && nextMarkdown === prevMarkdown) {
+          return false;
+        }
+
+        if (pollRef.current) {
+          if (typeof pollRef.current === "function") {
+            pollRef.current();
+          } else {
+            clearInterval(pollRef.current);
+          }
+          pollRef.current = null;
+        }
+
+        // 완전히 동일하면 페이드 대신 바로 summary로 (사용자는 “원래대로 돌아갔다”고 느끼기 쉬움)
+        if (nextMarkdown === prevMarkdown) {
+          setFadeTo(nextMarkdown);
+          setVisualPhase("summary");
+          setStatusMsg("문체가 적용되었지만 본문 변화가 거의 없습니다. (말투/규칙이 약하거나 이미 비슷한 문체일 수 있어요)");
+          setBusy(false);
+          if (onRestyleComplete) onRestyleComplete();
+          return true;
+        }
+
+        setFadeTo(nextMarkdown);
+        setVisualPhase("fade");
+        return true;
+      };
+
+      const startArtifactPollingFallback = () => {
+        pollRef.current = setInterval(async () => {
+          attempts++;
+          setPollTick(attempts);
+          if (attempts > MAX_ATTEMPTS) {
+            clearInterval(pollRef.current);
+            pollRef.current = null;
+            setError("시간 초과: 결과를 직접 새로고침해 주세요.");
+            setBusy(false);
+            setStatusMsg("");
+            setVisualPhase("idle");
+            return;
+          }
+          try {
+            await finishWithArtifacts();
+          } catch {
+            //
+          }
+        }, 3000);
+      };
+
+      pollRef.current = startWorkflowEventStream(workflowId, (nextWorkflow) => {
         attempts++;
-        if (attempts > MAX_ATTEMPTS) {
-          clearInterval(pollRef.current);
-          setError("시간 초과: 결과를 직접 새로고침해 주세요.");
+        setPollTick(attempts);
+        if (nextWorkflow.status === "STYLE_APPLYING") {
+          setStatusMsg("선택한 말투로 문장을 다시 다듬는 중입니다.");
+        } else if (nextWorkflow.status === "REVIEWING") {
+          setStatusMsg("검수 에이전트가 새 문체 결과를 확인하는 중입니다.");
+        } else if (nextWorkflow.status === "FAILED") {
+          if (pollRef.current) pollRef.current();
+          pollRef.current = null;
+          setError(nextWorkflow.lastErrorMessage || "문체 재적용에 실패했습니다.");
           setBusy(false);
           setStatusMsg("");
+          setVisualPhase("idle");
           return;
         }
-        try {
-          const next = await fetchArtifact(workflowId, "review");
-          const nextMarkdown = next?.json?.final_markdown ?? next?.text ?? null;
-          if (nextMarkdown && nextMarkdown !== prevMarkdown) {
-            clearInterval(pollRef.current);
-            setStatusMsg("문체가 다시 적용되었습니다.");
-            setBusy(false);
-            if (onRestyleComplete) onRestyleComplete(next);
-          }
-        } catch { /* 폴링 실패는 무시하고 계속 */ }
-      }, 3000);
+        if (nextWorkflow.status === "COMPLETED") {
+          // COMPLETED인데 최종 본문이 크게 안 바뀌는 경우가 있다. 이때도 “적용됨/미미”를 표시한다.
+          finishWithArtifacts({ allowSameMarkdown: true }).catch(() => {
+            //
+          });
+        }
+      }, () => {
+        startArtifactPollingFallback();
+      });
     } catch (e) {
       setError(e.message);
       setBusy(false);
       setStatusMsg("");
+      setVisualPhase("idle");
     }
   }
+
+  const showVisual = visualPhase === "polling" || visualPhase === "fade" || visualPhase === "summary";
 
   return (
     <div className="card">
@@ -876,8 +1348,13 @@ function RestylePanel({ workflowId, onRestyleComplete }) {
       {error && <div className="alert alert-error mt-8">{error}</div>}
       {statusMsg && !error && (
         <div className="flex-row text-muted mt-8" style={{ fontSize: 13 }}>
-          {busy && <Loader2 className="spin" size={13} />}
+          {(busy || visualPhase === "fade") && <Loader2 className="spin" size={13} />}
           {statusMsg}
+        </div>
+      )}
+      {appliedMeta && !error && (
+        <div className="text-muted mt-6" style={{ fontSize: 12, lineHeight: 1.45 }}>
+          {appliedMeta}
         </div>
       )}
       <button
@@ -889,6 +1366,86 @@ function RestylePanel({ workflowId, onRestyleComplete }) {
         {busy ? <Loader2 className="spin" size={14} /> : <RefreshCw size={14} />}
         {busy ? "처리 중..." : "문체 다시 적용"}
       </button>
+
+      {showVisual && (
+        <div className="restyle-visual-card mt-12">
+          <div className="restyle-visual-head">
+            <Sparkles size={15} style={{ color: "var(--brand)" }} />
+            <span>문체 반영 미리보기</span>
+            {visualPhase === "polling" && (
+              <span className="restyle-visual-meta">
+                확인 {pollTick}회 · 약 3초마다 서버와 동기화
+              </span>
+            )}
+          </div>
+
+          {visualPhase === "polling" && (
+            <>
+              <p key={hintIndex} className="restyle-hint-rotate">
+                {RESTYLE_STAGE_HINTS[hintIndex]}
+              </p>
+              <p className="restyle-hint-sub">
+                아래는 적용 전 글입니다. 스캔 라인은 &quot;서버가 같은 글을 읽고 있다&quot;는 시각적 힌트이며,
+                실제 문장 치환은 서버에서 끝난 뒤 한 번에 반영됩니다.
+              </p>
+              <div className="restyle-dual-grid">
+                <div>
+                  <div className="restyle-pane-title">적용 전</div>
+                  <div className="restyle-pane markdown-wrap">
+                    <MarkdownPreview markdown={baselineMd || " "} workflowId={workflowId} />
+                  </div>
+                </div>
+                <div>
+                  <div className="restyle-pane-title">서버 처리 중 (동일 본문 · 스캔)</div>
+                  <div className="restyle-pane markdown-wrap">
+                    <RestyleScanningPreview markdown={baselineMd} workflowId={workflowId} active />
+                  </div>
+                </div>
+              </div>
+            </>
+          )}
+
+          {visualPhase === "fade" && fadeTo && (
+            <>
+              <p className="restyle-hint-sub">
+                새 버전을 받았습니다. 이전 글에서 새 글로 <strong>페이드</strong>합니다.
+              </p>
+              <div className="restyle-pane markdown-wrap restyle-pane--tall">
+                <RestyleCrossfadePreview
+                  workflowId={workflowId}
+                  fromMd={fadeFrom}
+                  toMd={fadeTo}
+                  durationMs={1600}
+                  onComplete={handleFadeDone}
+                />
+              </div>
+            </>
+          )}
+
+          {visualPhase === "summary" && fadeTo && (
+            <>
+              <div className="restyle-pane-title">적용 후</div>
+              <div className="restyle-pane markdown-wrap restyle-pane--tall">
+                <MarkdownPreview markdown={fadeTo} workflowId={workflowId} />
+              </div>
+              <RestyleDiffPanel oldText={fadeFrom} newText={fadeTo} />
+              <button
+                type="button"
+                className="btn btn-ghost btn-sm mt-8"
+                onClick={() => {
+                  setVisualPhase("idle");
+                  setStatusMsg("");
+                  setFadeFrom("");
+                  setFadeTo("");
+                  setBaselineMd("");
+                }}
+              >
+                미리보기 닫기
+              </button>
+            </>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -896,14 +1453,14 @@ function RestylePanel({ workflowId, onRestyleComplete }) {
 function StatusPill({ status }) {
   const cls =
     status === "COMPLETED" ? "completed" : status === "FAILED" ? "failed" : "";
-  return <span className={`status-pill ${cls}`}>{status}</span>;
+  return <span className={`status-pill ${cls}`}>{workflowStatusLabel(status)}</span>;
 }
 
 // ── Write Page ────────────────────────────────────────────────────────────────
 
 function WritePage() {
-  const [photoMode, setPhotoMode] = useState("id"); // "id" | "upload"
-  const [projectId, setProjectId] = useState("sample_images");
+  const [photoMode, setPhotoMode] = useState("upload"); // "upload" | "id"
+  const [projectId, setProjectId] = useState("");
   const [uploadedFiles, setUploadedFiles] = useState([]);
   const [dragOver, setDragOver] = useState(false);
   const [contentType, setContentType] = useState("블로그");
@@ -937,6 +1494,11 @@ function WritePage() {
     ...voiceProfiles,
   ];
   const activeVoiceProfile = allVoiceProfiles.find((profile) => profile.id === selectedVoiceProfileId);
+  const selectedMedia = mediaSummary(uploadedFiles);
+  const startDisabled =
+    busy
+    || (photoMode === "id" && !projectId.trim())
+    || (photoMode === "upload" && uploadedFiles.length === 0);
 
   useEffect(() => {
     fetchVoiceProfilesApi()
@@ -948,25 +1510,56 @@ function WritePage() {
 
   function stopPolling() {
     if (pollRef.current) {
-      clearInterval(pollRef.current);
+      if (typeof pollRef.current === "function") {
+        pollRef.current();
+      } else {
+        clearInterval(pollRef.current);
+      }
       pollRef.current = null;
     }
   }
 
   function startPolling(wfId) {
     stopPolling();
-    pollRef.current = setInterval(async () => {
-      try {
-        const data = await fetchWorkflow(wfId);
-        setWorkflow(data);
-        if (["COMPLETED", "FAILED"].includes(data.status)) {
-          stopPolling();
-          setPhase("done");
-        }
-      } catch {
-        // keep polling
+    let active = true;
+
+    const handleWorkflow = (data) => {
+      setWorkflow(data);
+      if (["COMPLETED", "FAILED"].includes(data.status)) {
+        stopPolling();
+        setPhase("done");
       }
-    }, 2000);
+    };
+
+    const startFallbackPolling = () => {
+      if (!active) return;
+      const id = setInterval(async () => {
+        try {
+          const data = await fetchWorkflow(wfId);
+          handleWorkflow(data);
+        } catch {
+          // keep polling
+        }
+      }, 2000);
+      pollRef.current = () => {
+        active = false;
+        clearInterval(id);
+      };
+    };
+
+    const stopStream = startWorkflowEventStream(
+      wfId,
+      handleWorkflow,
+      () => {
+        if (!active) return;
+        stopStream();
+        startFallbackPolling();
+      }
+    );
+    pollRef.current = () => {
+      active = false;
+      stopStream();
+    };
   }
 
   useEffect(() => () => stopPolling(), []);
@@ -1034,6 +1627,23 @@ function WritePage() {
     }
   }
 
+  async function handleRetry() {
+    if (!workflow?.workflowId) return;
+    setBusy(true);
+    setError("");
+    try {
+      await retryWorkflowApi(workflow.workflowId);
+      const updated = await fetchWorkflow(workflow.workflowId);
+      setWorkflow(updated);
+      setPhase("running");
+      startPolling(workflow.workflowId);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   function handleReset() {
     stopPolling();
     setUploadedFiles((prev) => {
@@ -1049,11 +1659,11 @@ function WritePage() {
     return (
       <div className="page">
         <title>새 글 쓰기 | Momently</title>
-        <div className="page-header">
-          <div className="flex-row" style={{ justifyContent: "space-between" }}>
+        <div className="page-header page-header-row">
+          <div className="flex-row" style={{ justifyContent: "space-between", width: "100%" }}>
             <div>
-              <h2>글쓰기 진행 중</h2>
-              <p style={{ color: "var(--text-muted)", fontSize: 13, marginTop: 4 }}>
+              <h2>{workflow?.status === "COMPLETED" ? "글이 완성됐습니다" : workflow?.status === "FAILED" ? "다시 시도할 수 있습니다" : "글을 만들고 있습니다"}</h2>
+              <p className="mono-muted">
                 {workflow?.workflowId}
               </p>
             </div>
@@ -1070,7 +1680,30 @@ function WritePage() {
           <div className="card-title">
             <Activity size={14} /> 파이프라인
           </div>
-          <PipelineSteps status={workflow?.status ?? "CREATED"} />
+          {workflow && (
+            <div className="workflow-summary-strip">
+              <div>
+                <span>현재 상태</span>
+                <strong>{workflowStatusLabel(workflow.status)}</strong>
+              </div>
+              <div>
+                <span>입력 묶음</span>
+                <strong>{workflow.projectId || "-"}</strong>
+              </div>
+              <div>
+                <span>그룹</span>
+                <strong>{workflow.groupCount ?? "-"}</strong>
+              </div>
+            </div>
+          )}
+          <PipelineSteps
+            status={workflow?.status ?? "CREATED"}
+            showActivityRail={
+              phase === "running" &&
+              !!workflow &&
+              !["COMPLETED", "FAILED"].includes(workflow.status)
+            }
+          />
           <MetricsRow workflow={workflow} />
         </div>
 
@@ -1090,12 +1723,33 @@ function WritePage() {
         )}
 
         {phase === "done" && workflow?.status === "FAILED" && (
-          <div className="alert alert-error mt-12">파이프라인 실행에 실패했습니다.</div>
+          <div className="alert alert-error mt-12">
+            <div><strong>파이프라인 실행에 실패했습니다.</strong></div>
+            {workflow.lastFailedStep && (
+              <div className="text-muted mt-4">실패 단계: {workflowStatusLabel(workflow.lastFailedStep)}</div>
+            )}
+            {workflow.lastErrorMessage && (
+              <div className="text-muted mt-4">{workflow.lastErrorMessage}</div>
+            )}
+            <div className="flex-row mt-8">
+              <button className="btn btn-primary" type="button" onClick={handleRetry} disabled={busy}>
+                {busy ? <Loader2 className="spin" size={15} /> : <RefreshCw size={15} />} 재시도
+              </button>
+              <button className="btn btn-ghost" type="button" onClick={handleReset} disabled={busy}>
+                새로 작성
+              </button>
+            </div>
+          </div>
         )}
 
         {phase === "running" && (
-          <div className="flex-row text-muted mt-12">
-            <Loader2 className="spin" size={16} /> 자동으로 상태를 확인하고 있습니다...
+          <div className="pipeline-running-foot mt-12">
+            <div className="flex-row text-muted">
+              <Loader2 className="spin" size={16} /> 자동으로 상태를 확인하고 있습니다.
+            </div>
+            {workflow && (
+              <p className="pipeline-running-caption">{pipelineLiveCaption(workflow.status)}</p>
+            )}
           </div>
         )}
       </div>
@@ -1108,38 +1762,24 @@ function WritePage() {
       <meta name="description" content="사진과 동영상을 업로드하고 AI가 블로그 글을 자동으로 작성합니다." />
       <div className="page-header">
         <h2>새 글 쓰기</h2>
-        <p>사진·동영상과 콘텐츠 유형을 선택하고 AI가 블로그 글을 작성합니다.</p>
+        <p>사진·동영상을 올리면 장면 분석부터 초안, 문체 적용, 검수까지 한 번에 진행합니다.</p>
       </div>
 
-      {/* Photo section */}
+      {/* Media section */}
       <div className="card">
-        <div className="card-title"><Image size={14} /> 미디어</div>
-        <div className="mode-toggle">
-          <button
-            className={photoMode === "id" ? "active" : ""}
-            onClick={() => setPhotoMode("id")}
-          >
-            프로젝트 ID
-          </button>
-          <button
-            className={photoMode === "upload" ? "active" : ""}
-            onClick={() => setPhotoMode("upload")}
-          >
-            파일 업로드
-          </button>
+        <div className="section-heading">
+          <div>
+            <div className="card-title"><Image size={14} /> 미디어</div>
+            <p>일반 사용자는 파일만 올리면 됩니다. 프로젝트 ID는 서버가 자동으로 만듭니다.</p>
+          </div>
+          {uploadedFiles.length > 0 && (
+            <span className="media-count-badge">
+              {uploadedFiles.length}개 · {formatBytes(selectedMedia.totalBytes)}
+            </span>
+          )}
         </div>
 
-        {photoMode === "id" ? (
-          <div className="field">
-            <label>프로젝트 ID</label>
-            <input
-              type="text"
-              value={projectId}
-              onChange={(e) => setProjectId(e.target.value)}
-              placeholder="sample_images"
-            />
-          </div>
-        ) : (
+        {photoMode === "upload" ? (
           <>
             <div
               className={`dropzone ${dragOver ? "drag-over" : ""}`}
@@ -1161,33 +1801,138 @@ function WritePage() {
               onChange={(e) => handleFiles(e.target.files)}
             />
             {uploadedFiles.length > 0 && (
-              <div className="photo-thumbs">
-                {uploadedFiles.map((item, i) => (
-                  <div key={i} className="photo-thumb">
-                    {item.kind === "image" ? (
-                      <img src={item.url} alt="" />
-                    ) : (
-                      <div className="video-thumb">
-                        <Video size={22} />
-                        <span>{item.file.name}</span>
-                      </div>
-                    )}
-                    <button
-                      className="photo-thumb-remove"
-                      onClick={(e) => { e.stopPropagation(); removePhoto(i); }}
-                    >
-                      <X size={11} />
-                    </button>
+              <div className="media-review">
+                <div className="media-review-head">
+                  <div>
+                    <strong>선택한 미디어</strong>
+                    <span>사진 {selectedMedia.images}개 · 동영상 {selectedMedia.videos}개</span>
                   </div>
-                ))}
+                  <button
+                    type="button"
+                    className="btn btn-ghost btn-sm"
+                    onClick={() => setUploadedFiles((prev) => {
+                      prev.forEach((item) => URL.revokeObjectURL(item.url));
+                      return [];
+                    })}
+                  >
+                    <Trash2 size={13} /> 비우기
+                  </button>
+                </div>
+                <div className="photo-thumbs">
+                  {uploadedFiles.map((item, i) => (
+                    <div key={`${item.file.name}-${i}`} className="photo-thumb">
+                      {item.kind === "image" ? (
+                        <img src={item.url} alt="" />
+                      ) : (
+                        <div className="video-thumb">
+                          <Video size={22} />
+                          <span>{item.file.name}</span>
+                        </div>
+                      )}
+                      <button
+                        type="button"
+                        className="photo-thumb-remove"
+                        aria-label={`${item.file.name} 제거`}
+                        onClick={(e) => { e.stopPropagation(); removePhoto(i); }}
+                      >
+                        <X size={11} />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+                <div className="media-file-list">
+                  {uploadedFiles.slice(0, 6).map((item, i) => (
+                    <div key={`${item.file.name}-row-${i}`} className="media-file-row">
+                      {item.kind === "image" ? <Image size={14} /> : <Video size={14} />}
+                      <span>{item.file.name}</span>
+                      <em>{formatBytes(item.file.size)}</em>
+                    </div>
+                  ))}
+                  {uploadedFiles.length > 6 && (
+                    <div className="media-file-row media-file-row-muted">
+                      <span>외 {uploadedFiles.length - 6}개</span>
+                    </div>
+                  )}
+                </div>
               </div>
             )}
             <p className="text-muted mt-8" style={{ fontSize: 12, lineHeight: 1.55 }}>
-              서버에 올린 뒤 자동으로 새 프로젝트 ID가 만들어지며, 미디어는 설정된 입력 폴더에만 저장됩니다.
-              파일당 최대 25MB, 전체 최대 약 120MB(스프링 설정 기준)까지입니다. 업로드 API는 로그인(JWT) 후에만
-              호출됩니다.
+              업로드하면 서버가 내부 프로젝트 ID를 자동으로 만들고, 이 ID로 글쓰기 워크플로를 실행합니다.
+              파일당 최대 25MB, 전체 최대 약 120MB(스프링 설정 기준)까지입니다.
             </p>
           </>
+        ) : (
+          <div className="field">
+            <label>서버 미디어 묶음 ID</label>
+            <input
+              type="text"
+              value={projectId}
+              onChange={(e) => setProjectId(e.target.value)}
+              placeholder="예: sample_images"
+            />
+            <p className="text-muted mt-8" style={{ fontSize: 12, lineHeight: 1.55 }}>
+              이미 서버 입력 폴더에 준비된 미디어 묶음을 재실행할 때만 사용합니다.
+              일반 글쓰기는 파일 업로드를 사용하는 것이 좋습니다.
+            </p>
+          </div>
+        )}
+      </div>
+
+      {/* Advanced */}
+      <div className="card">
+        <button
+          className="collapsible-header"
+          style={{ borderTop: "none", paddingTop: 0 }}
+          onClick={() => setAdvancedOpen((v) => !v)}
+        >
+          <span className="flex-row" style={{ gap: 6 }}>
+            <Settings size={14} /> 고급 옵션
+          </span>
+          {advancedOpen ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
+        </button>
+        {advancedOpen && (
+          <div className="collapsible-body">
+            <div className="alert alert-warn mt-8">
+              서버 묶음 ID는 이미 서버 입력 폴더에 파일이 올라가 있는 경우에만 씁니다. 보통은 파일 업로드를 그대로 사용하세요.
+            </div>
+            <div className="field">
+              <label>미디어 입력 방식</label>
+              <div className="mode-toggle">
+                <button
+                  type="button"
+                  className={photoMode === "upload" ? "active" : ""}
+                  onClick={() => setPhotoMode("upload")}
+                >
+                  파일 업로드
+                </button>
+                <button
+                  type="button"
+                  className={photoMode === "id" ? "active" : ""}
+                  onClick={() => setPhotoMode("id")}
+                >
+                  서버 묶음 ID
+                </button>
+              </div>
+            </div>
+            <div className="field">
+              <label>그룹화 전략</label>
+              <select value={groupingStrategy} onChange={(e) => setGroupingStrategy(e.target.value)}>
+                <option value="LOCATION_BASED">LOCATION_BASED</option>
+                <option value="TIME_BASED">TIME_BASED</option>
+                <option value="SCENE_BASED">SCENE_BASED</option>
+              </select>
+            </div>
+            <div className="field">
+              <label>Time Window (분)</label>
+              <input
+                type="number"
+                min={1}
+                value={timeWindowMinutes}
+                onChange={(e) => setTimeWindowMinutes(e.target.value)}
+                style={{ width: 120 }}
+              />
+            </div>
+          </div>
         )}
       </div>
 
@@ -1207,7 +1952,7 @@ function WritePage() {
         </div>
 
         {contentType === "체험단" && (
-          <div className="card" style={{ marginTop: 14, marginBottom: 0 }}>
+          <div className="rule-panel">
             <div className="card-title"><Settings size={13} /> 체험단 규칙</div>
             <div className="field">
               <label>최소 사진 수</label>
@@ -1294,57 +2039,26 @@ function WritePage() {
         )}
       </div>
 
-      {/* Advanced */}
-      <div className="card">
-        <button
-          className="collapsible-header"
-          style={{ borderTop: "none", paddingTop: 0 }}
-          onClick={() => setAdvancedOpen((v) => !v)}
-        >
-          <span className="flex-row" style={{ gap: 6 }}>
-            <Settings size={14} /> 고급 옵션
-          </span>
-          {advancedOpen ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
-        </button>
-        {advancedOpen && (
-          <div className="collapsible-body">
-            <div className="field">
-              <label>그룹화 전략</label>
-              <select value={groupingStrategy} onChange={(e) => setGroupingStrategy(e.target.value)}>
-                <option value="LOCATION_BASED">LOCATION_BASED</option>
-                <option value="TIME_BASED">TIME_BASED</option>
-                <option value="SCENE_BASED">SCENE_BASED</option>
-              </select>
-            </div>
-            <div className="field">
-              <label>Time Window (분)</label>
-              <input
-                type="number"
-                min={1}
-                value={timeWindowMinutes}
-                onChange={(e) => setTimeWindowMinutes(e.target.value)}
-                style={{ width: 120 }}
-              />
-            </div>
-          </div>
-        )}
-      </div>
-
       {error && <div className="alert alert-error">{error}</div>}
 
-      <button
-        className="btn btn-primary btn-lg"
-        style={{ width: "100%", marginTop: 8 }}
-        onClick={handleStart}
-        disabled={
-          busy
-          || (photoMode === "id" && !projectId.trim())
-          || (photoMode === "upload" && uploadedFiles.length === 0)
-        }
-      >
-        {busy ? <Loader2 className="spin" size={18} /> : <Play size={18} />}
-        글쓰기 시작
-      </button>
+      <div className="start-panel">
+        <div>
+          <strong>{photoMode === "upload" ? `${uploadedFiles.length}개 미디어로 시작` : "서버 묶음 ID로 시작"}</strong>
+          <span>
+            {photoMode === "upload"
+              ? "업로드 후 자동으로 프로젝트 ID를 만들고 워크플로를 실행합니다."
+              : projectId.trim() || "프로젝트 ID를 입력하세요."}
+          </span>
+        </div>
+        <button
+          className="btn btn-primary btn-lg"
+          onClick={handleStart}
+          disabled={startDisabled}
+        >
+          {busy ? <Loader2 className="spin" size={18} /> : <Play size={18} />}
+          {busy ? "시작 중..." : "글쓰기 시작"}
+        </button>
+      </div>
     </div>
   );
 }
@@ -1358,7 +2072,8 @@ function TonePage() {
   const [formDesc, setFormDesc] = useState("");
   const [selectedProfileId, setSelectedProfileId] = useState("");
   const [sampleTitle, setSampleTitle] = useState("");
-  const [sampleContent, setSampleContent] = useState("");
+  const [sampleMarkdown, setSampleMarkdown] = useState("");
+  const sampleEditorRef = useRef(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
@@ -1384,6 +2099,10 @@ function TonePage() {
     refreshProfiles();
   }, []);
 
+  useEffect(() => {
+    setSampleMarkdown("");
+  }, [selectedProfileId]);
+
   async function handleSave() {
     if (!formName.trim()) return;
     setLoading(true);
@@ -1404,16 +2123,18 @@ function TonePage() {
   }
 
   async function handleAddSample() {
-    if (!selectedProfile || !sampleContent.trim()) return;
+    const body = sampleEditorRef.current?.getMarkdown?.()?.trim() ?? sampleMarkdown.trim();
+    if (!selectedProfile || !body) return;
     setLoading(true);
     setError("");
     try {
-      const updated = await addVoiceSampleApi(selectedProfile.id, sampleTitle, sampleContent);
+      const updated = await addVoiceSampleApi(selectedProfile.id, sampleTitle, body);
       const next = profiles.map((profile) => profile.id === updated.id ? updated : profile);
       setProfiles(next);
       saveCachedVoiceProfiles(next);
       setSampleTitle("");
-      setSampleContent("");
+      setSampleMarkdown("");
+      sampleEditorRef.current?.clear?.();
     } catch (e) {
       setError(e.message);
     } finally {
@@ -1559,18 +2280,23 @@ function TonePage() {
             </div>
             <div className="field">
               <label>평소에 쓴 글</label>
-              <textarea
-                value={sampleContent}
-                onChange={(e) => setSampleContent(e.target.value)}
-                placeholder="블로그, 일기, 리뷰, 캡션처럼 평소 말투가 드러나는 글을 붙여넣으세요. 분석 후 아래에 그 말투로 쓴 가상 예시 글이 나옵니다."
-                rows={8}
+              <p className="field-hint">
+                TipTap 에디터에서 블로그 글을 붙여 넣을 수 있습니다. 사진·캡처는 JPEG로 줄여{" "}
+                <code>![](data:…)</code> 마크다운으로 변환된 뒤 서버에 저장됩니다. 외부 URL 이미지는 그대로 링크로
+                남습니다.
+              </p>
+              <VoiceSampleEditor
+                ref={sampleEditorRef}
+                disabled={loading}
+                resetKey={selectedProfileId}
+                onMarkdownChange={setSampleMarkdown}
               />
             </div>
             <div className="flex-row" style={{ justifyContent: "flex-end", gap: 8 }}>
               <button className="btn btn-secondary btn-sm" onClick={handleAnalyze} disabled={loading}>
                 <RefreshCw size={13} /> 다시 분석
               </button>
-              <button className="btn btn-primary btn-sm" onClick={handleAddSample} disabled={!sampleContent.trim() || loading}>
+              <button className="btn btn-primary btn-sm" onClick={handleAddSample} disabled={!sampleMarkdown.trim() || loading}>
                 {loading ? <Loader2 className="spin" size={13} /> : <Sparkles size={13} />}
                 학습하기
               </button>
@@ -1683,7 +2409,8 @@ function HistoryPage() {
     setDetailError("");
     setLoadingDetail(true);
     try {
-      const wid = typeof item.workflowId === "string" ? item.workflowId.trim() : "";
+      const rawId = item.workflowId ?? item.workflow_id;
+      const wid = typeof rawId === "string" ? rawId.trim() : rawId != null ? String(rawId).trim() : "";
       if (!HISTORY_WORKFLOW_ID_RE.test(wid)) {
         throw new Error("저장된 작업 ID가 올바르지 않습니다. 브라우저 작업 기록을 비우거나 새 작업부터 다시 시도해 주세요.");
       }
@@ -1708,11 +2435,10 @@ function HistoryPage() {
         <div className="page-header">
           <div className="flex-row" style={{ justifyContent: "space-between", flexWrap: "wrap", gap: 10 }}>
             <div>
-              <h2 style={{ fontSize: 17, fontFamily: "ui-monospace, monospace", fontWeight: 700 }}>
-                {selected.workflowId}
-              </h2>
+              <h2>{workflowTitle(workflow || selected)}</h2>
               <p>
-                {selected.projectId || selected.contentType || "워크플로"} &middot; {selected.groupingStrategy || "-"}
+                <span className="mono-muted">{selected.workflowId}</span>
+                {selected.groupingStrategy ? <> · {selected.groupingStrategy}</> : null}
               </p>
             </div>
             {workflow && <StatusPill status={workflow.status} />}
@@ -1731,7 +2457,10 @@ function HistoryPage() {
           <>
             <div className="card">
               <div className="card-title"><Activity size={14} /> 파이프라인</div>
-              <PipelineSteps status={workflow.status} />
+              <PipelineSteps
+                status={workflow.status}
+                showActivityRail={!["COMPLETED", "FAILED"].includes(workflow.status)}
+              />
               <MetricsRow workflow={workflow} />
             </div>
 
@@ -1755,6 +2484,18 @@ function HistoryPage() {
                 />
               </>
             )}
+
+            {workflow.status === "FAILED" && (
+              <div className="alert alert-error mt-12">
+                <strong>작업이 실패했습니다.</strong>
+                {workflow.lastFailedStep && (
+                  <div className="text-muted mt-4">실패 단계: {workflowStatusLabel(workflow.lastFailedStep)}</div>
+                )}
+                {workflow.lastErrorMessage && (
+                  <div className="text-muted mt-4">{workflow.lastErrorMessage}</div>
+                )}
+              </div>
+            )}
           </>
         )}
       </div>
@@ -1769,13 +2510,19 @@ function HistoryPage() {
         <div className="history-header">
           <div>
             <h2>작업 기록</h2>
-            <p>이전에 실행한 글쓰기 작업 목록입니다.</p>
+            <p>완성된 글을 다시 열거나 실패한 작업의 원인을 확인할 수 있습니다.</p>
           </div>
-          {history.length > 0 && (
-            <button type="button" className="btn btn-ghost btn-sm" onClick={clearAllHistory}>
-              <Trash2 size={14} /> 전체 삭제
+          <div className="flex-row">
+            <button type="button" className="btn btn-secondary btn-sm" onClick={loadServerHistory} disabled={loadingHistory}>
+              {loadingHistory ? <Loader2 className="spin" size={14} /> : <RefreshCw size={14} />}
+              새로고침
             </button>
-          )}
+            {history.length > 0 && (
+              <button type="button" className="btn btn-ghost btn-sm" onClick={clearAllHistory}>
+                <Trash2 size={14} /> 전체 삭제
+              </button>
+            )}
+          </div>
         </div>
       </div>
 
@@ -1787,7 +2534,9 @@ function HistoryPage() {
         </div>
       ) : history.length === 0 ? (
         <div className="history-empty">
-          아직 작업 기록이 없습니다. 새 글 쓰기 페이지에서 시작해보세요.
+          <FileText size={28} />
+          <strong>아직 작업 기록이 없습니다</strong>
+          <span>새 글 쓰기에서 사진이나 동영상을 올리면 이곳에 작업이 쌓입니다.</span>
         </div>
       ) : (
         <div className="history-list">
@@ -1801,9 +2550,10 @@ function HistoryPage() {
                 <FileText size={18} />
               </div>
               <div className="history-item-info">
-                <div className="history-item-id">{item.workflowId}</div>
+                <div className="history-item-id">{workflowTitle(item)}</div>
                 <div className="history-item-meta">
-                  {item.projectId || item.contentType || "워크플로"} &middot; {item.groupingStrategy || "-"}
+                  <span className="mono-muted">{item.workflowId}</span>
+                  {item.groupingStrategy ? <> · {item.groupingStrategy}</> : null}
                 </div>
               </div>
               <StatusPill status={item.status ?? "UNKNOWN"} />
@@ -1865,8 +2615,13 @@ function MonitorPage() {
     setBusy(true);
     msg("");
     try {
-      await runWorkflowApi(workflowId);
-      msg("실행을 시작했습니다.", "success");
+      if (status === "FAILED") {
+        await retryWorkflowApi(workflowId);
+        msg("재시도를 시작했습니다.", "success");
+      } else {
+        await runWorkflowApi(workflowId);
+        msg("실행을 시작했습니다.", "success");
+      }
       await doRefresh(false);
     } catch (e) {
       msg(e.message, "error");
@@ -1945,7 +2700,8 @@ function MonitorPage() {
             <Sparkles size={15} /> Create
           </button>
           <button className="btn btn-primary" onClick={doRun} disabled={busy}>
-            {busy ? <Loader2 className="spin" size={15} /> : <Play size={15} />} Run
+            {busy ? <Loader2 className="spin" size={15} /> : status === "FAILED" ? <RefreshCw size={15} /> : <Play size={15} />}
+            {status === "FAILED" ? "Retry" : "Run"}
           </button>
           <button className="btn btn-ghost" onClick={() => doRefresh()} disabled={!workflowId || busy}>
             <RefreshCw size={15} /> Refresh
@@ -1972,7 +2728,10 @@ function MonitorPage() {
           <div className="text-muted" style={{ marginBottom: 12, fontSize: 12 }}>
             ID: {workflowId}
           </div>
-          <PipelineSteps status={status} />
+          <PipelineSteps
+            status={status}
+            showActivityRail={!["COMPLETED", "FAILED"].includes(status)}
+          />
           <MetricsRow workflow={workflow} />
         </div>
       )}
