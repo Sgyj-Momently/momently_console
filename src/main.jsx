@@ -494,6 +494,9 @@ function startWorkflowEventStream(workflowId, onWorkflow, onError) {
       blocks.forEach(handleBlock);
     }
     if (buffer.trim()) handleBlock(buffer);
+    if (!controller.signal.aborted) {
+      throw new Error("SSE 스트림이 종료되었습니다.");
+    }
   })().catch((error) => {
     if (!controller.signal.aborted) onError(error);
   });
@@ -1698,6 +1701,7 @@ function WritePage() {
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [artifactKey, setArtifactKey] = useState(0);
+  const [connectionMode, setConnectionMode] = useState("idle");
 
   const fileInputRef = useRef(null);
   const pollRef = useRef(null);
@@ -1734,11 +1738,13 @@ function WritePage() {
       }
       pollRef.current = null;
     }
+    setConnectionMode("idle");
   }
 
   function startPolling(wfId) {
     stopPolling();
     let active = true;
+    setConnectionMode("live");
 
     const handleWorkflow = (data) => {
       setWorkflow(data);
@@ -1750,6 +1756,7 @@ function WritePage() {
 
     const startFallbackPolling = () => {
       if (!active) return;
+      setConnectionMode("polling");
       const id = setInterval(async () => {
         try {
           const data = await fetchWorkflow(wfId);
@@ -1975,7 +1982,10 @@ function WritePage() {
         {phase === "running" && (
           <div className="pipeline-running-foot mt-12">
             <div className="flex-row text-muted">
-              <Loader2 className="spin" size={16} /> 자동으로 상태를 확인하고 있습니다.
+              <Loader2 className="spin" size={16} />
+              {connectionMode === "polling"
+                ? "실시간 연결이 끊겨 2초마다 상태를 확인하고 있습니다."
+                : "실시간으로 상태를 확인하고 있습니다."}
             </div>
             {workflow && (
               <p className="pipeline-running-caption">{pipelineLiveCaption(workflow.status)}</p>
