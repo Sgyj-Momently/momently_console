@@ -14,6 +14,8 @@ import {
   ChevronDown,
   ChevronUp,
   Clock,
+  Copy,
+  Download,
   FileText,
   Image,
   Loader2,
@@ -386,7 +388,14 @@ async function uploadMediaApi(files) {
   return uploadMultipartJson(orchPath("/api/v1/uploads/media"), form);
 }
 
-async function createWorkflowApi(projectId, groupingStrategy, timeWindowMinutes, voiceProfileId) {
+async function createWorkflowApi(
+  projectId,
+  groupingStrategy,
+  timeWindowMinutes,
+  voiceProfileId,
+  contentType,
+  writingInstructions
+) {
   return apiRequest(orchPath("/api/v1/workflows"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -395,6 +404,8 @@ async function createWorkflowApi(projectId, groupingStrategy, timeWindowMinutes,
       groupingStrategy,
       timeWindowMinutes: Number(timeWindowMinutes),
       voiceProfileId: voiceProfileId === "기본" ? null : voiceProfileId,
+      contentType: contentType || null,
+      writingInstructions: writingInstructions || null,
     }),
   });
 }
@@ -422,6 +433,8 @@ function workflowFromEventPayload(payload) {
   return {
     workflowId: payload.workflowId,
     projectId: payload.projectId,
+    contentType: payload.contentType,
+    writingInstructions: payload.writingInstructions,
     status: payload.status,
     photoCount: payload.photoCount,
     privacyExcludedCount: payload.privacyExcludedCount,
@@ -512,6 +525,30 @@ async function deleteWorkflowHistoryApi() {
 
 async function fetchArtifact(workflowId, type) {
   return apiRequest(orchPath(`/api/v1/workflows/${workflowId}/artifacts/${type}`));
+}
+
+async function fetchLatestArtifactEdit(workflowId, type) {
+  const url = orchPath(`/api/v1/workflows/${workflowId}/artifacts/${type}/edits/latest`);
+  const headers = orchestratorAuthHeaders();
+  const response = await fetch(url, { headers });
+  if (response.status === 401 && requestCarriesOrcAuthorization(headers)) {
+    clearExpiredSessionFromUnauthorized(headers);
+  }
+  if (response.status === 404) return null;
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(httpErrorMessage(response, parseErrorDetail(body)));
+  }
+  const data = await response.json();
+  return data?.content ?? data;
+}
+
+async function saveArtifactEditApi(workflowId, type, markdown) {
+  return apiRequest(orchPath(`/api/v1/workflows/${workflowId}/artifacts/${type}/edits`), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ markdown }),
+  });
 }
 
 async function fetchWorkflowFileBlob(workflowId, fileName) {
@@ -610,6 +647,16 @@ function pipelineLiveCaption(status) {
   return "파이프라인 상태를 불러오는 중입니다.";
 }
 
+function pipelineProgressPercent(status) {
+  if (status === "COMPLETED") return 100;
+  if (status === "FAILED") return 100;
+  const index = currentStepIndex(status);
+  if (index < 0) return 3;
+  const active = IN_PROGRESS_MAP[status] !== undefined;
+  const completedUnits = active ? index : index + 1;
+  return Math.max(3, Math.min(99, Math.round((completedUnits / (PIPELINE_STEPS.length - 1)) * 100)));
+}
+
 /** 줄 단위 LCS 기반 diff (문체 재적용 후 어디가 바뀌었는지 표시용) */
 function diffLinesByLcs(oldText, newText) {
   const a = oldText === "" ? [] : oldText.split("\n");
@@ -651,10 +698,15 @@ function diffLinesByLcs(oldText, newText) {
 
 function PipelineLiveRail({ status }) {
   if (status === "COMPLETED" || status === "FAILED") return null;
+  const percent = pipelineProgressPercent(status);
   return (
     <div className="pipeline-live-rail" aria-live="polite">
-      <div className="pipeline-indeterminate-track" aria-hidden>
-        <div className="pipeline-indeterminate-bar" />
+      <div className="pipeline-progress-head">
+        <strong>{workflowStatusLabel(status)}</strong>
+        <span>{percent}%</span>
+      </div>
+      <div className="pipeline-progress-track" aria-hidden>
+        <div className="pipeline-progress-bar" style={{ width: `${percent}%` }} />
       </div>
       <p className="pipeline-live-caption">{pipelineLiveCaption(status)}</p>
     </div>
@@ -806,6 +858,22 @@ function mediaSummary(files) {
   const videos = files.filter((item) => item.kind === "video").length;
   const totalBytes = files.reduce((sum, item) => sum + (item.file?.size || 0), 0);
   return { images, videos, totalBytes };
+}
+
+function downloadTextFile(fileName, text) {
+  const blob = new Blob([text], { type: "text/markdown;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = fileName;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  URL.revokeObjectURL(url);
+}
+
+function editedArtifactKey(workflowId, tab) {
+  return `momently_edited_artifact_${workflowId}_${tab}`;
 }
 
 // ── Auth shell ─────────────────────────────────────────────────────────────────
@@ -1051,6 +1119,13 @@ function ArtifactViewer({ workflowId, tabs = ARTIFACT_TABS }) {
   const [artifact, setArtifact] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [showRaw, setShowRaw] = useState(false);
+  const [editMode, setEditMode] = useState(false);
+  const [editedMarkdown, setEditedMarkdown] = useState("");
+  const [serverMarkdown, setServerMarkdown] = useState("");
+  const [serverEditPath, setServerEditPath] = useState("");
+  const [savingEdit, setSavingEdit] = useState(false);
+  const [actionMsg, setActionMsg] = useState("");
 
   async function load(type) {
     setActiveTab(type);
@@ -1058,9 +1133,17 @@ function ArtifactViewer({ workflowId, tabs = ARTIFACT_TABS }) {
     setError("");
     try {
       const data = await fetchArtifact(workflowId, type);
+      const latestEdit = await fetchLatestArtifactEdit(workflowId, type);
       setArtifact(data);
+      setServerMarkdown(latestEdit?.text || "");
+      setServerEditPath(latestEdit?.path || "");
+      setShowRaw(false);
+      setEditMode(false);
+      setActionMsg("");
     } catch (e) {
       setArtifact(null);
+      setServerMarkdown("");
+      setServerEditPath("");
       setError(e.message);
     } finally {
       setLoading(false);
@@ -1071,8 +1154,80 @@ function ArtifactViewer({ workflowId, tabs = ARTIFACT_TABS }) {
     if (workflowId) load(tabs[0]?.[0] ?? "blog");
   }, [workflowId]);
 
-  const markdown = extractMarkdown(artifact);
+  const originalMarkdown = extractMarkdown(artifact);
+  const markdown = serverMarkdown || originalMarkdown;
   const raw = formatArtifactText(artifact);
+  const visibleMarkdown = editMode ? editedMarkdown : markdown;
+  const hasLocalEdit = editedMarkdown !== markdown;
+  const hasServerEdit = Boolean(serverMarkdown);
+
+  useEffect(() => {
+    const key = editedArtifactKey(workflowId, activeTab);
+    let saved = "";
+    try {
+      saved = localStorage.getItem(key) || "";
+    } catch {
+      //
+    }
+    setEditedMarkdown(saved || markdown);
+  }, [workflowId, activeTab, markdown]);
+
+  useEffect(() => {
+    if (!workflowId || !activeTab || !editedMarkdown || editedMarkdown === markdown) return;
+    try {
+      localStorage.setItem(editedArtifactKey(workflowId, activeTab), editedMarkdown);
+    } catch {
+      //
+    }
+  }, [workflowId, activeTab, editedMarkdown, markdown]);
+
+  async function copyMarkdown() {
+    if (!visibleMarkdown.trim()) return;
+    try {
+      await navigator.clipboard.writeText(visibleMarkdown);
+      setActionMsg("본문을 클립보드에 복사했습니다.");
+    } catch {
+      setActionMsg("브라우저 권한 때문에 복사하지 못했습니다. 수정 모드에서 직접 선택해 복사해 주세요.");
+    }
+  }
+
+  function downloadMarkdown() {
+    if (!visibleMarkdown.trim()) return;
+    downloadTextFile(`momently-${activeTab || "post"}.md`, visibleMarkdown);
+    setActionMsg("마크다운 파일을 저장했습니다.");
+  }
+
+  async function saveEditedMarkdown() {
+    if (!editedMarkdown.trim()) return;
+    setSavingEdit(true);
+    setActionMsg("");
+    try {
+      const saved = await saveArtifactEditApi(workflowId, activeTab, editedMarkdown);
+      setServerMarkdown(saved?.text || editedMarkdown);
+      setServerEditPath(saved?.path || "");
+      try {
+        localStorage.removeItem(editedArtifactKey(workflowId, activeTab));
+      } catch {
+        //
+      }
+      setEditMode(false);
+      setActionMsg("수정본을 서버에 저장했습니다.");
+    } catch (e) {
+      setActionMsg(e.message || "수정본 저장에 실패했습니다.");
+    } finally {
+      setSavingEdit(false);
+    }
+  }
+
+  function discardLocalEdit() {
+    try {
+      localStorage.removeItem(editedArtifactKey(workflowId, activeTab));
+    } catch {
+      //
+    }
+    setEditedMarkdown(markdown);
+    setActionMsg("화면에 저장된 수정본을 원본으로 되돌렸습니다.");
+  }
 
   return (
     <div>
@@ -1089,27 +1244,85 @@ function ArtifactViewer({ workflowId, tabs = ARTIFACT_TABS }) {
         ))}
       </div>
       {error && <div className="alert alert-error mt-8">{error}</div>}
-      <div className="artifact-body">
-        <div className="artifact-pane">
+      <div className="artifact-reader">
+        <div className="artifact-toolbar">
+          <div>
+            <strong>{tabs.find(([key]) => key === activeTab)?.[1] ?? "결과물"}</strong>
+            <span>
+              {editMode
+                ? "수정 내용은 브라우저에 임시 저장되고, 서버 저장을 누르면 다른 기기에서도 이어볼 수 있습니다."
+                : hasLocalEdit
+                  ? "브라우저에 임시 저장된 수정본을 보고 있습니다."
+                  : hasServerEdit
+                    ? "서버에 저장된 최신 수정본을 보고 있습니다."
+                    : "완성 글을 바로 확인하고 복사할 수 있습니다."}
+            </span>
+          </div>
+          <div className="artifact-actions">
+            <button type="button" className="btn btn-secondary btn-sm" onClick={() => setEditMode((value) => !value)} disabled={loading || !markdown}>
+              <PenLine size={13} /> {editMode ? "미리보기" : "수정"}
+            </button>
+            {editMode && (
+              <button type="button" className="btn btn-primary btn-sm" onClick={saveEditedMarkdown} disabled={loading || savingEdit || !editedMarkdown.trim() || !hasLocalEdit}>
+                {savingEdit ? <Loader2 className="spin" size={13} /> : <Download size={13} />}
+                서버 저장
+              </button>
+            )}
+            <button type="button" className="btn btn-secondary btn-sm" onClick={copyMarkdown} disabled={loading || !visibleMarkdown.trim()}>
+              <Copy size={13} /> 복사
+            </button>
+            <button type="button" className="btn btn-secondary btn-sm" onClick={downloadMarkdown} disabled={loading || !visibleMarkdown.trim()}>
+              <Download size={13} /> 저장
+            </button>
+            {hasLocalEdit && (
+              <button type="button" className="btn btn-ghost btn-sm" onClick={discardLocalEdit} disabled={loading}>
+                <RefreshCw size={13} /> 원본
+              </button>
+            )}
+          </div>
+        </div>
+        {hasServerEdit && !hasLocalEdit && (
+          <div className="artifact-edit-note mt-8">서버 저장본: {serverEditPath || "latest"}</div>
+        )}
+        {hasLocalEdit && <div className="alert alert-warn mt-8">아직 서버에 저장하지 않은 임시 수정본이 표시되고 있습니다.</div>}
+        {actionMsg && <div className="alert alert-success mt-8">{actionMsg}</div>}
+        <div className="artifact-pane artifact-pane-main">
           <div className="artifact-pane-header">
-            <Image size={13} /> 미리보기
+            <Image size={13} /> {editMode ? "본문 수정" : "글 미리보기"}
           </div>
           <div className="artifact-pane markdown-wrap">
             {loading ? (
               <div className="flex-row text-muted" style={{ padding: "20px 0" }}>
                 <Loader2 className="spin" size={16} /> 불러오는 중...
               </div>
+            ) : editMode ? (
+              <textarea
+                className="artifact-editor"
+                value={editedMarkdown}
+                onChange={(event) => setEditedMarkdown(event.target.value)}
+                spellCheck={false}
+              />
             ) : (
-              <MarkdownPreview markdown={markdown} workflowId={workflowId} />
+              <MarkdownPreview markdown={visibleMarkdown} workflowId={workflowId} />
             )}
           </div>
         </div>
-        <div className="artifact-pane">
-          <div className="artifact-pane-header">
-            <FileText size={13} /> Raw JSON
+        <button
+          type="button"
+          className="raw-toggle"
+          onClick={() => setShowRaw((value) => !value)}
+        >
+          {showRaw ? <ChevronUp size={15} /> : <ChevronDown size={15} />}
+          상세 데이터 보기
+        </button>
+        {showRaw && (
+          <div className="artifact-pane artifact-pane-raw">
+            <div className="artifact-pane-header">
+              <FileText size={13} /> Raw JSON
+            </div>
+            <pre>{loading ? "..." : raw || "아티팩트를 선택하면 내용이 표시됩니다."}</pre>
           </div>
-          <pre>{loading ? "..." : raw || "아티팩트를 선택하면 내용이 표시됩니다."}</pre>
-        </div>
+        )}
       </div>
     </div>
   );
@@ -1480,6 +1693,7 @@ function WritePage() {
 
   // Running state
   const [phase, setPhase] = useState("form"); // "form" | "running" | "done"
+  const [writeStep, setWriteStep] = useState(1);
   const [workflow, setWorkflow] = useState(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -1499,6 +1713,9 @@ function WritePage() {
     busy
     || (photoMode === "id" && !projectId.trim())
     || (photoMode === "upload" && uploadedFiles.length === 0);
+  const canContinueFromMedia =
+    (photoMode === "upload" && uploadedFiles.length > 0)
+    || (photoMode === "id" && projectId.trim());
 
   useEffect(() => {
     fetchVoiceProfilesApi()
@@ -1614,7 +1831,19 @@ function WritePage() {
         setUploadedFiles([]);
       }
 
-      const wf = await createWorkflowApi(effectiveProjectId, groupingStrategy, timeWindowMinutes, selectedVoiceProfileId);
+      const writingInstructions = [
+        contentType ? `글 종류: ${contentType}` : "",
+        direction.trim() ? `작성 방향: ${direction.trim()}` : "",
+        contentType === "체험단" ? `체험단 조건: 최소 사진 ${minPhotos}개${includeSignage ? ", 간판 사진 포함" : ""}${mentionBrand && brandName.trim() ? `, 상호명 ${brandName.trim()} 언급` : ""}${extraRules.trim() ? `, ${extraRules.trim()}` : ""}` : "",
+      ].filter(Boolean).join("\n");
+      const wf = await createWorkflowApi(
+        effectiveProjectId,
+        groupingStrategy,
+        timeWindowMinutes,
+        selectedVoiceProfileId,
+        contentType,
+        writingInstructions
+      );
       await runWorkflowApi(wf.workflowId);
       const updated = await fetchWorkflow(wf.workflowId);
       setWorkflow(updated);
@@ -1651,6 +1880,7 @@ function WritePage() {
       return [];
     });
     setPhase("form");
+    setWriteStep(1);
     setWorkflow(null);
     setError("");
   }
@@ -1760,304 +1990,406 @@ function WritePage() {
     <div className="page">
       <title>새 글 쓰기 | Momently</title>
       <meta name="description" content="사진과 동영상을 업로드하고 AI가 블로그 글을 자동으로 작성합니다." />
-      <div className="page-header">
-        <h2>새 글 쓰기</h2>
-        <p>사진·동영상을 올리면 장면 분석부터 초안, 문체 적용, 검수까지 한 번에 진행합니다.</p>
-      </div>
-
-      {/* Media section */}
-      <div className="card">
-        <div className="section-heading">
-          <div>
-            <div className="card-title"><Image size={14} /> 미디어</div>
-            <p>일반 사용자는 파일만 올리면 됩니다. 프로젝트 ID는 서버가 자동으로 만듭니다.</p>
-          </div>
-          {uploadedFiles.length > 0 && (
-            <span className="media-count-badge">
-              {uploadedFiles.length}개 · {formatBytes(selectedMedia.totalBytes)}
-            </span>
-          )}
+      <div className="write-hero">
+        <div>
+          <h2>사진과 동영상으로 글 만들기</h2>
+          <p>미디어를 고르고, 원하는 느낌만 선택하면 AI가 블로그 글을 완성합니다.</p>
         </div>
-
-        {photoMode === "upload" ? (
-          <>
-            <div
-              className={`dropzone ${dragOver ? "drag-over" : ""}`}
-              onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
-              onDragLeave={() => setDragOver(false)}
-              onDrop={handleDrop}
-              onClick={() => fileInputRef.current?.click()}
-            >
-              <Upload size={28} color="#8aa898" />
-              <p>사진이나 동영상을 드래그하거나 클릭해서 선택하세요</p>
-              <span>JPG · PNG · WEBP · HEIC/HEIF · MP4 · MOV · M4V 지원 (최대 {UPLOAD_MAX_FILES}개)</span>
-            </div>
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept=".jpg,.jpeg,.png,.webp,.heic,.heif,.mp4,.mov,.m4v,image/*,video/*"
-              multiple
-              style={{ display: "none" }}
-              onChange={(e) => handleFiles(e.target.files)}
-            />
-            {uploadedFiles.length > 0 && (
-              <div className="media-review">
-                <div className="media-review-head">
-                  <div>
-                    <strong>선택한 미디어</strong>
-                    <span>사진 {selectedMedia.images}개 · 동영상 {selectedMedia.videos}개</span>
-                  </div>
-                  <button
-                    type="button"
-                    className="btn btn-ghost btn-sm"
-                    onClick={() => setUploadedFiles((prev) => {
-                      prev.forEach((item) => URL.revokeObjectURL(item.url));
-                      return [];
-                    })}
-                  >
-                    <Trash2 size={13} /> 비우기
-                  </button>
-                </div>
-                <div className="photo-thumbs">
-                  {uploadedFiles.map((item, i) => (
-                    <div key={`${item.file.name}-${i}`} className="photo-thumb">
-                      {item.kind === "image" ? (
-                        <img src={item.url} alt="" />
-                      ) : (
-                        <div className="video-thumb">
-                          <Video size={22} />
-                          <span>{item.file.name}</span>
-                        </div>
-                      )}
-                      <button
-                        type="button"
-                        className="photo-thumb-remove"
-                        aria-label={`${item.file.name} 제거`}
-                        onClick={(e) => { e.stopPropagation(); removePhoto(i); }}
-                      >
-                        <X size={11} />
-                      </button>
-                    </div>
-                  ))}
-                </div>
-                <div className="media-file-list">
-                  {uploadedFiles.slice(0, 6).map((item, i) => (
-                    <div key={`${item.file.name}-row-${i}`} className="media-file-row">
-                      {item.kind === "image" ? <Image size={14} /> : <Video size={14} />}
-                      <span>{item.file.name}</span>
-                      <em>{formatBytes(item.file.size)}</em>
-                    </div>
-                  ))}
-                  {uploadedFiles.length > 6 && (
-                    <div className="media-file-row media-file-row-muted">
-                      <span>외 {uploadedFiles.length - 6}개</span>
-                    </div>
-                  )}
-                </div>
-              </div>
-            )}
-            <p className="text-muted mt-8" style={{ fontSize: 12, lineHeight: 1.55 }}>
-              업로드하면 서버가 내부 프로젝트 ID를 자동으로 만들고, 이 ID로 글쓰기 워크플로를 실행합니다.
-              파일당 최대 25MB, 전체 최대 약 120MB(스프링 설정 기준)까지입니다.
-            </p>
-          </>
-        ) : (
-          <div className="field">
-            <label>서버 미디어 묶음 ID</label>
-            <input
-              type="text"
-              value={projectId}
-              onChange={(e) => setProjectId(e.target.value)}
-              placeholder="예: sample_images"
-            />
-            <p className="text-muted mt-8" style={{ fontSize: 12, lineHeight: 1.55 }}>
-              이미 서버 입력 폴더에 준비된 미디어 묶음을 재실행할 때만 사용합니다.
-              일반 글쓰기는 파일 업로드를 사용하는 것이 좋습니다.
-            </p>
-          </div>
-        )}
-      </div>
-
-      {/* Advanced */}
-      <div className="card">
-        <button
-          className="collapsible-header"
-          style={{ borderTop: "none", paddingTop: 0 }}
-          onClick={() => setAdvancedOpen((v) => !v)}
-        >
-          <span className="flex-row" style={{ gap: 6 }}>
-            <Settings size={14} /> 고급 옵션
-          </span>
-          {advancedOpen ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
-        </button>
-        {advancedOpen && (
-          <div className="collapsible-body">
-            <div className="alert alert-warn mt-8">
-              서버 묶음 ID는 이미 서버 입력 폴더에 파일이 올라가 있는 경우에만 씁니다. 보통은 파일 업로드를 그대로 사용하세요.
-            </div>
-            <div className="field">
-              <label>미디어 입력 방식</label>
-              <div className="mode-toggle">
-                <button
-                  type="button"
-                  className={photoMode === "upload" ? "active" : ""}
-                  onClick={() => setPhotoMode("upload")}
-                >
-                  파일 업로드
-                </button>
-                <button
-                  type="button"
-                  className={photoMode === "id" ? "active" : ""}
-                  onClick={() => setPhotoMode("id")}
-                >
-                  서버 묶음 ID
-                </button>
-              </div>
-            </div>
-            <div className="field">
-              <label>그룹화 전략</label>
-              <select value={groupingStrategy} onChange={(e) => setGroupingStrategy(e.target.value)}>
-                <option value="LOCATION_BASED">LOCATION_BASED</option>
-                <option value="TIME_BASED">TIME_BASED</option>
-                <option value="SCENE_BASED">SCENE_BASED</option>
-              </select>
-            </div>
-            <div className="field">
-              <label>Time Window (분)</label>
-              <input
-                type="number"
-                min={1}
-                value={timeWindowMinutes}
-                onChange={(e) => setTimeWindowMinutes(e.target.value)}
-                style={{ width: 120 }}
-              />
-            </div>
-          </div>
-        )}
-      </div>
-
-      {/* Content type */}
-      <div className="card">
-        <div className="card-title"><PenLine size={14} /> 콘텐츠 유형</div>
-        <div className="chip-group">
-          {CONTENT_TYPES.map((ct) => (
+        <div className="write-stepper" aria-label="글쓰기 단계">
+          {[
+            [1, "미디어"],
+            [2, "스타일"],
+            [3, "확인"],
+          ].map(([step, label]) => (
             <button
-              key={ct}
-              className={`chip ${contentType === ct ? "active" : ""}`}
-              onClick={() => setContentType(ct)}
+              key={step}
+              type="button"
+              className={`write-step ${writeStep === step ? "active" : writeStep > step ? "done" : ""}`}
+              onClick={() => {
+                if (step === 1 || canContinueFromMedia || step < writeStep) setWriteStep(step);
+              }}
             >
-              {ct}
+              <span>{step}</span>
+              {label}
             </button>
           ))}
         </div>
+      </div>
 
-        {contentType === "체험단" && (
-          <div className="rule-panel">
-            <div className="card-title"><Settings size={13} /> 체험단 규칙</div>
-            <div className="field">
-              <label>최소 사진 수</label>
-              <input
-                type="number"
-                min={1}
-                value={minPhotos}
-                onChange={(e) => setMinPhotos(e.target.value)}
-                style={{ width: 100 }}
-              />
+      {writeStep === 1 && (
+        <div className="write-stage">
+          <div className="stage-copy">
+            <span>1단계</span>
+            <h3>글에 넣을 사진이나 동영상을 올려주세요</h3>
+            <p>프로젝트 ID는 서버가 자동으로 만들어요. 보통은 이 화면에서 파일만 선택하면 됩니다.</p>
+          </div>
+
+          <div className="card">
+            <div className="section-heading">
+              <div>
+                <div className="card-title"><Image size={14} /> 미디어 업로드</div>
+                <p>분위기, 장소, 음식, 메뉴판처럼 글에 필요한 장면을 넉넉히 올려주세요.</p>
+              </div>
+              {uploadedFiles.length > 0 && (
+                <span className="media-count-badge">
+                  {uploadedFiles.length}개 · {formatBytes(selectedMedia.totalBytes)}
+                </span>
+              )}
             </div>
-            <label className="flex-row" style={{ gap: 8, marginBottom: 10, cursor: "pointer" }}>
-              <input
-                type="checkbox"
-                checked={includeSignage}
-                onChange={(e) => setIncludeSignage(e.target.checked)}
-              />
-              <span style={{ fontSize: 13 }}>간판이 잘 보이는 사진 포함</span>
-            </label>
-            <label className="flex-row" style={{ gap: 8, marginBottom: 10, cursor: "pointer" }}>
-              <input
-                type="checkbox"
-                checked={mentionBrand}
-                onChange={(e) => setMentionBrand(e.target.checked)}
-              />
-              <span style={{ fontSize: 13 }}>상호명 언급 필수</span>
-            </label>
-            {mentionBrand && (
+
+            {photoMode === "upload" ? (
+              <>
+                <div
+                  className={`dropzone ${dragOver ? "drag-over" : ""}`}
+                  onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
+                  onDragLeave={() => setDragOver(false)}
+                  onDrop={handleDrop}
+                  onClick={() => fileInputRef.current?.click()}
+                >
+                  <Upload size={32} color="var(--brand)" />
+                  <p>여기로 끌어오거나 클릭해서 선택</p>
+                  <span>JPG · PNG · WEBP · HEIC/HEIF · MP4 · MOV · M4V 지원</span>
+                </div>
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept=".jpg,.jpeg,.png,.webp,.heic,.heif,.mp4,.mov,.m4v,image/*,video/*"
+                  multiple
+                  style={{ display: "none" }}
+                  onChange={(e) => handleFiles(e.target.files)}
+                />
+                {uploadedFiles.length > 0 && (
+                  <div className="media-review">
+                    <div className="media-review-head">
+                      <div>
+                        <strong>선택한 미디어</strong>
+                        <span>사진 {selectedMedia.images}개 · 동영상 {selectedMedia.videos}개</span>
+                      </div>
+                      <button
+                        type="button"
+                        className="btn btn-ghost btn-sm"
+                        onClick={() => setUploadedFiles((prev) => {
+                          prev.forEach((item) => URL.revokeObjectURL(item.url));
+                          return [];
+                        })}
+                      >
+                        <Trash2 size={13} /> 비우기
+                      </button>
+                    </div>
+                    <div className="photo-thumbs">
+                      {uploadedFiles.map((item, i) => (
+                        <div key={`${item.file.name}-${i}`} className="photo-thumb">
+                          {item.kind === "image" ? (
+                            <img src={item.url} alt="" />
+                          ) : (
+                            <div className="video-thumb">
+                              <Video size={22} />
+                              <span>{item.file.name}</span>
+                            </div>
+                          )}
+                          <button
+                            type="button"
+                            className="photo-thumb-remove"
+                            aria-label={`${item.file.name} 제거`}
+                            onClick={(e) => { e.stopPropagation(); removePhoto(i); }}
+                          >
+                            <X size={11} />
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                    <div className="media-file-list">
+                      {uploadedFiles.slice(0, 6).map((item, i) => (
+                        <div key={`${item.file.name}-row-${i}`} className="media-file-row">
+                          {item.kind === "image" ? <Image size={14} /> : <Video size={14} />}
+                          <span>{item.file.name}</span>
+                          <em>{formatBytes(item.file.size)}</em>
+                        </div>
+                      ))}
+                      {uploadedFiles.length > 6 && (
+                        <div className="media-file-row media-file-row-muted">
+                          <span>외 {uploadedFiles.length - 6}개</span>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </>
+            ) : (
               <div className="field">
-                <label>상호명</label>
+                <label>서버 미디어 묶음 ID</label>
                 <input
                   type="text"
-                  value={brandName}
-                  onChange={(e) => setBrandName(e.target.value)}
-                  placeholder="상호명을 입력하세요"
+                  value={projectId}
+                  onChange={(e) => setProjectId(e.target.value)}
+                  placeholder="예: sample_images"
                 />
               </div>
             )}
-            <div className="field">
-              <label>추가 규칙</label>
-              <textarea
-                value={extraRules}
-                onChange={(e) => setExtraRules(e.target.value)}
-                placeholder="추가 규칙을 자유롭게 입력하세요."
-                rows={3}
-              />
+
+            <button
+              className="collapsible-header"
+              style={{ borderTop: "none" }}
+              onClick={() => setAdvancedOpen((v) => !v)}
+              type="button"
+            >
+              <span className="flex-row" style={{ gap: 6 }}>
+                <Settings size={14} /> 서버에 준비된 미디어 묶음 쓰기
+              </span>
+              {advancedOpen ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
+            </button>
+            {advancedOpen && (
+              <div className="collapsible-body">
+                <div className="alert alert-warn mt-8">
+                  이미 서버 입력 폴더에 파일이 올라가 있는 경우에만 사용하세요.
+                </div>
+                <div className="mode-toggle">
+                  <button
+                    type="button"
+                    className={photoMode === "upload" ? "active" : ""}
+                    onClick={() => setPhotoMode("upload")}
+                  >
+                    파일 업로드
+                  </button>
+                  <button
+                    type="button"
+                    className={photoMode === "id" ? "active" : ""}
+                    onClick={() => setPhotoMode("id")}
+                  >
+                    서버 묶음 ID
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {writeStep === 2 && (
+        <div className="write-stage">
+          <div className="stage-copy">
+            <span>2단계</span>
+            <h3>어떤 글로 만들까요?</h3>
+            <p>잘 모르겠으면 기본값 그대로 진행해도 됩니다. 나중에 문체는 다시 적용할 수 있어요.</p>
+          </div>
+
+          <div className="card">
+            <div className="card-title"><PenLine size={14} /> 글 종류</div>
+            <div className="option-card-grid">
+              {CONTENT_TYPES.map((ct) => (
+                <button
+                  key={ct}
+                  type="button"
+                  className={`option-card ${contentType === ct ? "active" : ""}`}
+                  onClick={() => setContentType(ct)}
+                >
+                  <strong>{ct}</strong>
+                  <span>
+                    {ct === "블로그" && "일상적인 후기 글"}
+                    {ct === "여행후기" && "장소와 동선을 살린 기록"}
+                    {ct === "음식후기" && "메뉴와 분위기 중심"}
+                    {ct === "체험단" && "필수 조건을 챙기는 글"}
+                    {ct === "이벤트" && "홍보성 안내 글"}
+                  </span>
+                </button>
+              ))}
+            </div>
+
+            {contentType === "체험단" && (
+              <div className="rule-panel">
+                <div className="card-title"><Settings size={13} /> 체험단 규칙</div>
+                <div className="field">
+                  <label>최소 사진 수</label>
+                  <input
+                    type="number"
+                    min={1}
+                    value={minPhotos}
+                    onChange={(e) => setMinPhotos(e.target.value)}
+                    style={{ width: 100 }}
+                  />
+                </div>
+                <label className="flex-row" style={{ gap: 8, marginBottom: 10, cursor: "pointer" }}>
+                  <input
+                    type="checkbox"
+                    checked={includeSignage}
+                    onChange={(e) => setIncludeSignage(e.target.checked)}
+                  />
+                  <span style={{ fontSize: 13 }}>간판이 잘 보이는 사진 포함</span>
+                </label>
+                <label className="flex-row" style={{ gap: 8, marginBottom: 10, cursor: "pointer" }}>
+                  <input
+                    type="checkbox"
+                    checked={mentionBrand}
+                    onChange={(e) => setMentionBrand(e.target.checked)}
+                  />
+                  <span style={{ fontSize: 13 }}>상호명 언급 필수</span>
+                </label>
+                {mentionBrand && (
+                  <div className="field">
+                    <label>상호명</label>
+                    <input
+                      type="text"
+                      value={brandName}
+                      onChange={(e) => setBrandName(e.target.value)}
+                      placeholder="상호명을 입력하세요"
+                    />
+                  </div>
+                )}
+                <div className="field">
+                  <label>추가 규칙</label>
+                  <textarea
+                    value={extraRules}
+                    onChange={(e) => setExtraRules(e.target.value)}
+                    placeholder="추가 규칙을 자유롭게 입력하세요."
+                    rows={3}
+                  />
+                </div>
+              </div>
+            )}
+          </div>
+
+          <div className="card">
+            <div className="card-title"><Palette size={14} /> 말투</div>
+            <div className="option-card-grid tone-option-grid">
+              {allVoiceProfiles.map((profile) => (
+                <button
+                  key={profile.id}
+                  type="button"
+                  className={`option-card ${selectedVoiceProfileId === profile.id ? "active" : ""}`}
+                  onClick={() => setSelectedVoiceProfileId(profile.id)}
+                >
+                  <strong>{profile.name}</strong>
+                  <span>{profile.description || profile.sample_preview || "기본 문체로 작성"}</span>
+                </button>
+              ))}
+            </div>
+            {activeVoiceProfile?.sample_preview && (
+              <div className="tone-preview">&ldquo;{activeVoiceProfile.sample_preview}&rdquo;</div>
+            )}
+          </div>
+
+          <div className="card">
+            <div className="card-title"><Sparkles size={14} /> 꼭 넣고 싶은 내용</div>
+            <textarea
+              value={direction}
+              onChange={(e) => setDirection(e.target.value)}
+              placeholder="예: 메뉴 이름을 자연스럽게 넣어줘. 너무 광고처럼 보이지 않게 써줘."
+              rows={4}
+            />
+          </div>
+
+          <div className="card">
+            <button
+              className="collapsible-header"
+              style={{ borderTop: "none", paddingTop: 0 }}
+              onClick={() => setAdvancedOpen((v) => !v)}
+              type="button"
+            >
+              <span className="flex-row" style={{ gap: 6 }}>
+                <Settings size={14} /> 분석 기준 조정
+              </span>
+              {advancedOpen ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
+            </button>
+            {advancedOpen && (
+              <div className="collapsible-body advanced-grid">
+                <div className="field">
+                  <label>사진 그룹화 기준</label>
+                  <select value={groupingStrategy} onChange={(e) => setGroupingStrategy(e.target.value)}>
+                    <option value="LOCATION_BASED">장소 중심</option>
+                    <option value="TIME_BASED">시간 중심</option>
+                    <option value="SCENE_BASED">장면 중심</option>
+                  </select>
+                </div>
+                <div className="field">
+                  <label>시간 간격</label>
+                  <input
+                    type="number"
+                    min={1}
+                    value={timeWindowMinutes}
+                    onChange={(e) => setTimeWindowMinutes(e.target.value)}
+                  />
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {writeStep === 3 && (
+        <div className="write-stage">
+          <div className="stage-copy">
+            <span>3단계</span>
+            <h3>확인하고 시작하세요</h3>
+            <p>시작하면 업로드, 사진·동영상 분석, 글 작성까지 자동으로 진행됩니다.</p>
+          </div>
+
+          <div className="review-summary-card">
+            <div>
+              <span>미디어</span>
+              <strong>
+                {photoMode === "upload"
+                  ? `${uploadedFiles.length}개 · 사진 ${selectedMedia.images} / 동영상 ${selectedMedia.videos}`
+                  : projectId.trim() || "서버 묶음 ID 미입력"}
+              </strong>
+            </div>
+            <div>
+              <span>글 종류</span>
+              <strong>{contentType}</strong>
+            </div>
+            <div>
+              <span>말투</span>
+              <strong>{activeVoiceProfile?.name || "기본"}</strong>
+            </div>
+            <div>
+              <span>작성 방향</span>
+              <strong>{direction.trim() || "AI가 사진을 보고 자연스럽게 구성"}</strong>
             </div>
           </div>
-        )}
-      </div>
-
-      {/* Direction */}
-      <div className="card">
-        <div className="card-title"><Sparkles size={14} /> 작성 방향</div>
-        <div className="field">
-          <textarea
-            value={direction}
-            onChange={(e) => setDirection(e.target.value)}
-            placeholder="어떤 내용이 들어갔으면 좋겠는지 자유롭게 입력해주세요."
-            rows={3}
-          />
         </div>
-      </div>
-
-      {/* Tone */}
-      <div className="card">
-        <div className="card-title"><Palette size={14} /> 말투 프로필</div>
-        <div className="chip-group">
-          {allVoiceProfiles.map((profile) => (
-            <button
-              key={profile.id}
-              className={`chip ${selectedVoiceProfileId === profile.id ? "active" : ""}`}
-              onClick={() => setSelectedVoiceProfileId(profile.id)}
-            >
-              {profile.name}
-            </button>
-          ))}
-        </div>
-        {activeVoiceProfile?.sample_preview && (
-          <div className="tone-preview">&ldquo;{activeVoiceProfile.sample_preview}&rdquo;</div>
-        )}
-        {activeVoiceProfile?.style_prompt && (
-          <div className="tone-preview">{activeVoiceProfile.style_prompt}</div>
-        )}
-      </div>
+      )}
 
       {error && <div className="alert alert-error">{error}</div>}
 
       <div className="start-panel">
         <div>
-          <strong>{photoMode === "upload" ? `${uploadedFiles.length}개 미디어로 시작` : "서버 묶음 ID로 시작"}</strong>
+          <strong>
+            {writeStep === 1 && "먼저 미디어를 선택하세요"}
+            {writeStep === 2 && "글 스타일을 골라주세요"}
+            {writeStep === 3 && (photoMode === "upload" ? `${uploadedFiles.length}개 미디어로 시작` : "서버 묶음 ID로 시작")}
+          </strong>
           <span>
-            {photoMode === "upload"
-              ? "업로드 후 자동으로 프로젝트 ID를 만들고 워크플로를 실행합니다."
-              : projectId.trim() || "프로젝트 ID를 입력하세요."}
+            {writeStep === 1 && "사진이나 동영상을 올리면 다음 단계로 갈 수 있습니다."}
+            {writeStep === 2 && "기본값으로도 충분합니다. 필요한 것만 바꾸세요."}
+            {writeStep === 3 && "업로드 후 자동으로 프로젝트 ID를 만들고 워크플로를 실행합니다."}
           </span>
         </div>
-        <button
-          className="btn btn-primary btn-lg"
-          onClick={handleStart}
-          disabled={startDisabled}
-        >
-          {busy ? <Loader2 className="spin" size={18} /> : <Play size={18} />}
-          {busy ? "시작 중..." : "글쓰기 시작"}
-        </button>
+        <div className="start-actions">
+          {writeStep > 1 && (
+            <button className="btn btn-ghost btn-lg" type="button" onClick={() => setWriteStep((step) => Math.max(1, step - 1))}>
+              이전
+            </button>
+          )}
+          {writeStep < 3 ? (
+            <button
+              className="btn btn-primary btn-lg"
+              type="button"
+              onClick={() => setWriteStep((step) => Math.min(3, step + 1))}
+              disabled={writeStep === 1 && !canContinueFromMedia}
+            >
+              다음
+            </button>
+          ) : (
+            <button
+              className="btn btn-primary btn-lg"
+              type="button"
+              onClick={handleStart}
+              disabled={startDisabled}
+            >
+              {busy ? <Loader2 className="spin" size={18} /> : <Play size={18} />}
+              {busy ? "시작 중..." : "글쓰기 시작"}
+            </button>
+          )}
+        </div>
       </div>
     </div>
   );
