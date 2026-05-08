@@ -62,10 +62,14 @@ function getAccessToken() {
   }
 }
 
-function persistAccessToken(token) {
+function persistAccessToken(token, remember = false) {
   try {
     sessionStorage.setItem(STORAGE_TOKEN_KEY, token);
-    localStorage.setItem(STORAGE_TOKEN_KEY, token);
+    if (remember) {
+      localStorage.setItem(STORAGE_TOKEN_KEY, token);
+    } else {
+      localStorage.removeItem(STORAGE_TOKEN_KEY);
+    }
   } catch {
     //
   }
@@ -142,7 +146,12 @@ function httpErrorMessage(response, detail) {
 
 /** 서버 업로드 API와 동일한 확장자(대소문자 무시). */
 const UPLOAD_MEDIA_EXT_RE = /\.(jpe?g|png|heic|heif|webp|mp4|mov|m4v)$/i;
-const UPLOAD_MAX_FILES = 40;
+const DEFAULT_UPLOAD_LIMITS = {
+  maxFiles: 40,
+  maxBytesPerFile: 25 * 1024 * 1024,
+  maxTotalBytes: 120 * 1024 * 1024,
+  allowedExtensions: ["jpg", "jpeg", "png", "webp", "heic", "heif", "mp4", "mov", "m4v"],
+};
 
 const PIPELINE_STEPS = [
   ["CREATED", "준비"],
@@ -388,6 +397,17 @@ async function uploadMediaApi(files) {
   return uploadMultipartJson(orchPath("/api/v1/uploads/media"), form);
 }
 
+async function fetchUploadConfigApi() {
+  const data = await apiRequest(orchPath("/api/v1/uploads/config"));
+  return {
+    ...DEFAULT_UPLOAD_LIMITS,
+    ...(data || {}),
+    allowedExtensions: Array.isArray(data?.allowedExtensions) && data.allowedExtensions.length > 0
+      ? data.allowedExtensions
+      : DEFAULT_UPLOAD_LIMITS.allowedExtensions,
+  };
+}
+
 async function createWorkflowApi(
   projectId,
   groupingStrategy,
@@ -609,6 +629,10 @@ function isActiveStep(status, index) {
   const exact = PIPELINE_STEPS.findIndex(([key]) => key === status);
   if (exact >= 0) return false;
   return IN_PROGRESS_MAP[status] === index;
+}
+
+function isTerminalWorkflowStatus(status) {
+  return status === "COMPLETED" || status === "FAILED";
 }
 
 function formatScore(value) {
@@ -890,6 +914,7 @@ function LoginPage() {
   const navigate = useNavigate();
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
+  const [rememberLogin, setRememberLogin] = useState(false);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
 
@@ -899,7 +924,7 @@ function LoginPage() {
     setError("");
     try {
       const data = await loginApi(username.trim(), password);
-      persistAccessToken(data.accessToken);
+      persistAccessToken(data.accessToken, rememberLogin);
       navigate("/", { replace: true });
     } catch (err) {
       setError(err?.message || "로그인에 실패했습니다.");
@@ -974,6 +999,16 @@ function LoginPage() {
                 required
               />
             </div>
+
+            <label className="login-remember">
+              <input
+                type="checkbox"
+                checked={rememberLogin}
+                onChange={(event) => setRememberLogin(event.target.checked)}
+                disabled={busy}
+              />
+              <span>이 브라우저에서 로그인 유지</span>
+            </label>
 
             {error && <div className="alert alert-error">{error}</div>}
 
@@ -1197,7 +1232,7 @@ function ArtifactViewer({ workflowId, tabs = ARTIFACT_TABS }) {
   function downloadMarkdown() {
     if (!visibleMarkdown.trim()) return;
     downloadTextFile(`momently-${activeTab || "post"}.md`, visibleMarkdown);
-    setActionMsg("마크다운 파일을 저장했습니다.");
+    setActionMsg("마크다운 파일을 다운로드했습니다.");
   }
 
   async function saveEditedMarkdown() {
@@ -1275,7 +1310,7 @@ function ArtifactViewer({ workflowId, tabs = ARTIFACT_TABS }) {
               <Copy size={13} /> 복사
             </button>
             <button type="button" className="btn btn-secondary btn-sm" onClick={downloadMarkdown} disabled={loading || !visibleMarkdown.trim()}>
-              <Download size={13} /> 저장
+              <Download size={13} /> 다운로드
             </button>
             {hasLocalEdit && (
               <button type="button" className="btn btn-ghost btn-sm" onClick={discardLocalEdit} disabled={loading}>
@@ -1678,6 +1713,8 @@ function WritePage() {
   const [photoMode, setPhotoMode] = useState("upload"); // "upload" | "id"
   const [projectId, setProjectId] = useState("");
   const [uploadedFiles, setUploadedFiles] = useState([]);
+  const [uploadLimits, setUploadLimits] = useState(DEFAULT_UPLOAD_LIMITS);
+  const [uploadNotice, setUploadNotice] = useState("");
   const [dragOver, setDragOver] = useState(false);
   const [contentType, setContentType] = useState("블로그");
   const [direction, setDirection] = useState("");
@@ -1713,6 +1750,11 @@ function WritePage() {
   ];
   const activeVoiceProfile = allVoiceProfiles.find((profile) => profile.id === selectedVoiceProfileId);
   const selectedMedia = mediaSummary(uploadedFiles);
+  const uploadAccept = [
+    ...uploadLimits.allowedExtensions.map((ext) => `.${String(ext).replace(/^\./, "")}`),
+    "image/*",
+    "video/*",
+  ].join(",");
   const startDisabled =
     busy
     || (photoMode === "id" && !projectId.trim())
@@ -1727,6 +1769,9 @@ function WritePage() {
       .catch(() => {
         setVoiceProfiles(loadCachedVoiceProfiles());
       });
+    fetchUploadConfigApi()
+      .then(setUploadLimits)
+      .catch(() => setUploadLimits(DEFAULT_UPLOAD_LIMITS));
   }, []);
 
   function stopPolling() {
@@ -1790,21 +1835,60 @@ function WritePage() {
 
   function handleFiles(files) {
     const list = Array.from(files || []).filter(Boolean);
-    setUploadedFiles((prev) => {
-      const capped = [...prev];
-      for (const f of list) {
-        const mimeOk = typeof f.type === "string" && f.type.startsWith("image/");
-        const videoMimeOk = typeof f.type === "string" && f.type.startsWith("video/");
-        const extOk = typeof f.name === "string" && UPLOAD_MEDIA_EXT_RE.test(f.name);
-        if (!mimeOk && !videoMimeOk && !extOk) {
-          continue;
-        }
-        if (capped.length >= UPLOAD_MAX_FILES) break;
-        const kind = mimeOk || /\.(jpe?g|png|heic|heif|webp)$/i.test(f.name || "") ? "image" : "video";
-        capped.push({ file: f, url: URL.createObjectURL(f), kind });
+    const capped = [...uploadedFiles];
+    let totalBytes = capped.reduce((sum, item) => sum + (item.file?.size || 0), 0);
+    const rejected = {
+      unsupported: 0,
+      perFile: 0,
+      total: 0,
+      count: 0,
+      duplicate: 0,
+    };
+    const existingKeys = new Set(capped.map((item) => (
+      `${item.file?.name || ""}:${item.file?.size || 0}:${item.file?.lastModified || 0}`
+    )));
+
+    for (const f of list) {
+      const mimeOk = typeof f.type === "string" && f.type.startsWith("image/");
+      const videoMimeOk = typeof f.type === "string" && f.type.startsWith("video/");
+      const extOk = typeof f.name === "string" && UPLOAD_MEDIA_EXT_RE.test(f.name);
+      if (!mimeOk && !videoMimeOk && !extOk) {
+        rejected.unsupported++;
+        continue;
       }
-      return capped;
-    });
+      if (f.size > uploadLimits.maxBytesPerFile) {
+        rejected.perFile++;
+        continue;
+      }
+      if (capped.length >= uploadLimits.maxFiles) {
+        rejected.count++;
+        continue;
+      }
+      if (totalBytes + f.size > uploadLimits.maxTotalBytes) {
+        rejected.total++;
+        continue;
+      }
+      const fileKey = `${f.name || ""}:${f.size || 0}:${f.lastModified || 0}`;
+      if (existingKeys.has(fileKey)) {
+        rejected.duplicate++;
+        continue;
+      }
+
+      const kind = mimeOk || /\.(jpe?g|png|heic|heif|webp)$/i.test(f.name || "") ? "image" : "video";
+      capped.push({ file: f, url: URL.createObjectURL(f), kind });
+      existingKeys.add(fileKey);
+      totalBytes += f.size;
+    }
+
+    setUploadedFiles(capped);
+    const messages = [
+      rejected.unsupported ? `지원하지 않는 형식 ${rejected.unsupported}개` : "",
+      rejected.perFile ? `파일당 ${formatBytes(uploadLimits.maxBytesPerFile)} 초과 ${rejected.perFile}개` : "",
+      rejected.total ? `전체 ${formatBytes(uploadLimits.maxTotalBytes)} 한도 초과 ${rejected.total}개` : "",
+      rejected.count ? `최대 ${uploadLimits.maxFiles}개 초과 ${rejected.count}개` : "",
+      rejected.duplicate ? `이미 선택한 파일 ${rejected.duplicate}개` : "",
+    ].filter(Boolean);
+    setUploadNotice(messages.length ? `${messages.join(", ")}는 제외했습니다.` : "");
   }
 
   function handleDrop(e) {
@@ -1818,6 +1902,13 @@ function WritePage() {
       URL.revokeObjectURL(prev[index].url);
       return prev.filter((_, i) => i !== index);
     });
+    setUploadNotice("");
+  }
+
+  function clearSelectedFiles() {
+    uploadedFiles.forEach((item) => URL.revokeObjectURL(item.url));
+    setUploadedFiles([]);
+    setUploadNotice("");
   }
 
   async function handleStart() {
@@ -1882,10 +1973,11 @@ function WritePage() {
 
   function handleReset() {
     stopPolling();
-    setUploadedFiles((prev) => {
-      prev.forEach((item) => URL.revokeObjectURL(item.url));
-      return [];
-    });
+      setUploadedFiles((prev) => {
+        prev.forEach((item) => URL.revokeObjectURL(item.url));
+        return [];
+      });
+      setUploadNotice("");
     setPhase("form");
     setWriteStep(1);
     setWorkflow(null);
@@ -2058,16 +2150,22 @@ function WritePage() {
                 >
                   <Upload size={32} color="var(--brand)" />
                   <p>여기로 끌어오거나 클릭해서 선택</p>
-                  <span>JPG · PNG · WEBP · HEIC/HEIF · MP4 · MOV · M4V 지원</span>
+                  <span>
+                    {uploadLimits.allowedExtensions.map((ext) => ext.toUpperCase()).join(" · ")} 지원 · 최대 {uploadLimits.maxFiles}개
+                  </span>
                 </div>
                 <input
                   ref={fileInputRef}
                   type="file"
-                  accept=".jpg,.jpeg,.png,.webp,.heic,.heif,.mp4,.mov,.m4v,image/*,video/*"
+                  accept={uploadAccept}
                   multiple
                   style={{ display: "none" }}
-                  onChange={(e) => handleFiles(e.target.files)}
+                  onChange={(e) => {
+                    handleFiles(e.target.files);
+                    e.target.value = "";
+                  }}
                 />
+                {uploadNotice && <div className="alert alert-warn mt-8">{uploadNotice}</div>}
                 {uploadedFiles.length > 0 && (
                   <div className="media-review">
                     <div className="media-review-head">
@@ -2078,10 +2176,7 @@ function WritePage() {
                       <button
                         type="button"
                         className="btn btn-ghost btn-sm"
-                        onClick={() => setUploadedFiles((prev) => {
-                          prev.forEach((item) => URL.revokeObjectURL(item.url));
-                          return [];
-                        })}
+                        onClick={clearSelectedFiles}
                       >
                         <Trash2 size={13} /> 비우기
                       </button>
@@ -2711,10 +2806,90 @@ function HistoryPage() {
   const [loadingDetail, setLoadingDetail] = useState(false);
   const [detailError, setDetailError] = useState("");
   const [historyArtifactKey, setHistoryArtifactKey] = useState(0);
+  const [detailBusy, setDetailBusy] = useState(false);
+  const [detailConnectionMode, setDetailConnectionMode] = useState("idle");
+  const [historyQuery, setHistoryQuery] = useState("");
+  const [historyStatusFilter, setHistoryStatusFilter] = useState("ALL");
+  const [confirmClearHistory, setConfirmClearHistory] = useState(false);
+  const detailPollRef = useRef(null);
+  const filteredHistory = history.filter((item) => {
+    const query = historyQuery.trim().toLowerCase();
+    const statusOk = historyStatusFilter === "ALL" || item.status === historyStatusFilter;
+    if (!statusOk) return false;
+    if (!query) return true;
+    return [
+      item.workflowId,
+      item.projectId,
+      item.contentType,
+      item.groupingStrategy,
+      item.status,
+    ].filter(Boolean).join(" ").toLowerCase().includes(query);
+  });
+  const historyStatusCounts = history.reduce((acc, item) => {
+    const status = item.status || "UNKNOWN";
+    acc[status] = (acc[status] || 0) + 1;
+    return acc;
+  }, {});
+
+  function stopDetailTracking() {
+    if (detailPollRef.current) {
+      detailPollRef.current();
+      detailPollRef.current = null;
+    }
+    setDetailConnectionMode("idle");
+  }
+
+  function startDetailTracking(workflowId) {
+    stopDetailTracking();
+    let active = true;
+    setDetailConnectionMode("live");
+
+    const handleWorkflow = (nextWorkflow) => {
+      setWorkflow(nextWorkflow);
+      setHistory((prev) => prev.map((item) => (
+        item.workflowId === nextWorkflow.workflowId ? { ...item, ...nextWorkflow } : item
+      )));
+      if (isTerminalWorkflowStatus(nextWorkflow.status)) {
+        stopDetailTracking();
+      }
+    };
+
+    const startFallbackPolling = () => {
+      if (!active) return;
+      setDetailConnectionMode("polling");
+      const id = setInterval(async () => {
+        try {
+          const data = await fetchWorkflow(workflowId);
+          handleWorkflow(data);
+        } catch {
+          //
+        }
+      }, 2000);
+      detailPollRef.current = () => {
+        active = false;
+        clearInterval(id);
+      };
+    };
+
+    const stopStream = startWorkflowEventStream(
+      workflowId,
+      handleWorkflow,
+      () => {
+        if (!active) return;
+        stopStream();
+        startFallbackPolling();
+      }
+    );
+    detailPollRef.current = () => {
+      active = false;
+      stopStream();
+    };
+  }
 
   async function loadServerHistory() {
     setLoadingHistory(true);
     setHistoryError("");
+    setConfirmClearHistory(false);
     try {
       const data = await fetchWorkflows();
       setHistory(Array.isArray(data) ? data : []);
@@ -2731,21 +2906,30 @@ function HistoryPage() {
     loadServerHistory();
   }, []);
 
+  useEffect(() => () => stopDetailTracking(), []);
+
   async function clearAllHistory() {
+    if (!confirmClearHistory) {
+      setConfirmClearHistory(true);
+      return;
+    }
     setHistoryError("");
     try {
       await deleteWorkflowHistoryApi();
+      stopDetailTracking();
       clearHistory();
       setHistory([]);
       setSelected(null);
       setWorkflow(null);
       setDetailError("");
+      setConfirmClearHistory(false);
     } catch (e) {
       setHistoryError(e.message);
     }
   }
 
   async function openItem(item) {
+    stopDetailTracking();
     setSelected(item);
     setWorkflow(null);
     setDetailError("");
@@ -2758,6 +2942,9 @@ function HistoryPage() {
       }
       const data = await fetchWorkflow(wid);
       setWorkflow(data);
+      if (!isTerminalWorkflowStatus(data.status)) {
+        startDetailTracking(wid);
+      }
     } catch (e) {
       setDetailError(e.message);
     } finally {
@@ -2765,11 +2952,28 @@ function HistoryPage() {
     }
   }
 
+  async function retrySelectedWorkflow() {
+    const wid = workflow?.workflowId;
+    if (!wid) return;
+    setDetailBusy(true);
+    setDetailError("");
+    try {
+      await retryWorkflowApi(wid);
+      const data = await fetchWorkflow(wid);
+      setWorkflow(data);
+      startDetailTracking(wid);
+    } catch (e) {
+      setDetailError(e.message);
+    } finally {
+      setDetailBusy(false);
+    }
+  }
+
   if (selected) {
     return (
       <div className="page">
         <div className="flex-row" style={{ marginBottom: 20 }}>
-          <button className="btn btn-ghost btn-sm" onClick={() => setSelected(null)}>
+          <button className="btn btn-ghost btn-sm" onClick={() => { stopDetailTracking(); setSelected(null); }}>
             ← 목록
           </button>
         </div>
@@ -2783,7 +2987,15 @@ function HistoryPage() {
                 {selected.groupingStrategy ? <> · {selected.groupingStrategy}</> : null}
               </p>
             </div>
-            {workflow && <StatusPill status={workflow.status} />}
+            <div className="flex-row">
+              {workflow?.status === "FAILED" && (
+                <button className="btn btn-primary btn-sm" type="button" onClick={retrySelectedWorkflow} disabled={detailBusy}>
+                  {detailBusy ? <Loader2 className="spin" size={14} /> : <RefreshCw size={14} />}
+                  재시도
+                </button>
+              )}
+              {workflow && <StatusPill status={workflow.status} />}
+            </div>
           </div>
         </div>
 
@@ -2804,6 +3016,16 @@ function HistoryPage() {
                 showActivityRail={!["COMPLETED", "FAILED"].includes(workflow.status)}
               />
               <MetricsRow workflow={workflow} />
+              {!isTerminalWorkflowStatus(workflow.status) && (
+                <div className="pipeline-running-foot mt-12">
+                  <div className="flex-row text-muted">
+                    <Loader2 className="spin" size={16} />
+                    {detailConnectionMode === "polling"
+                      ? "실시간 연결이 끊겨 2초마다 상태를 확인하고 있습니다."
+                      : "실시간으로 상태를 확인하고 있습니다."}
+                  </div>
+                </div>
+              )}
             </div>
 
             {["COMPLETED"].includes(workflow.status) && (
@@ -2836,6 +3058,12 @@ function HistoryPage() {
                 {workflow.lastErrorMessage && (
                   <div className="text-muted mt-4">{workflow.lastErrorMessage}</div>
                 )}
+                <div className="flex-row mt-8">
+                  <button className="btn btn-primary btn-sm" type="button" onClick={retrySelectedWorkflow} disabled={detailBusy}>
+                    {detailBusy ? <Loader2 className="spin" size={14} /> : <RefreshCw size={14} />}
+                    이 작업 재시도
+                  </button>
+                </div>
               </div>
             )}
           </>
@@ -2860,8 +3088,12 @@ function HistoryPage() {
               새로고침
             </button>
             {history.length > 0 && (
-              <button type="button" className="btn btn-ghost btn-sm" onClick={clearAllHistory}>
-                <Trash2 size={14} /> 전체 삭제
+              <button
+                type="button"
+                className={`btn ${confirmClearHistory ? "btn-danger" : "btn-ghost"} btn-sm`}
+                onClick={clearAllHistory}
+              >
+                <Trash2 size={14} /> {confirmClearHistory ? "정말 삭제" : "전체 삭제"}
               </button>
             )}
           </div>
@@ -2881,27 +3113,65 @@ function HistoryPage() {
           <span>새 글 쓰기에서 사진이나 동영상을 올리면 이곳에 작업이 쌓입니다.</span>
         </div>
       ) : (
-        <div className="history-list">
-          {history.map((item) => (
-            <button
-              key={item.workflowId}
-              className="history-item"
-              onClick={() => openItem(item)}
-            >
-              <div className="history-item-icon">
-                <FileText size={18} />
-              </div>
-              <div className="history-item-info">
-                <div className="history-item-id">{workflowTitle(item)}</div>
-                <div className="history-item-meta">
-                  <span className="mono-muted">{item.workflowId}</span>
-                  {item.groupingStrategy ? <> · {item.groupingStrategy}</> : null}
-                </div>
-              </div>
-              <StatusPill status={item.status ?? "UNKNOWN"} />
-            </button>
-          ))}
-        </div>
+        <>
+          <div className="history-tools">
+            <div className="field history-search">
+              <label>기록 검색</label>
+              <input
+                type="text"
+                value={historyQuery}
+                onChange={(event) => setHistoryQuery(event.target.value)}
+                placeholder="프로젝트, 글 종류, 작업 ID로 검색"
+              />
+            </div>
+            <div className="history-filter-row">
+              {[
+                ["ALL", `전체 ${history.length}`],
+                ["COMPLETED", `완료 ${historyStatusCounts.COMPLETED || 0}`],
+                ["FAILED", `실패 ${historyStatusCounts.FAILED || 0}`],
+              ].map(([key, label]) => (
+                <button
+                  key={key}
+                  type="button"
+                  className={`chip ${historyStatusFilter === key ? "active" : ""}`}
+                  onClick={() => setHistoryStatusFilter(key)}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {filteredHistory.length === 0 ? (
+            <div className="history-empty history-empty-compact">
+              <FileText size={24} />
+              <strong>조건에 맞는 기록이 없습니다</strong>
+              <span>검색어나 상태 필터를 바꿔보세요.</span>
+            </div>
+          ) : (
+            <div className="history-list">
+              {filteredHistory.map((item) => (
+                <button
+                  key={item.workflowId}
+                  className="history-item"
+                  onClick={() => openItem(item)}
+                >
+                  <div className="history-item-icon">
+                    <FileText size={18} />
+                  </div>
+                  <div className="history-item-info">
+                    <div className="history-item-id">{workflowTitle(item)}</div>
+                    <div className="history-item-meta">
+                      <span className="mono-muted">{item.workflowId}</span>
+                      {item.groupingStrategy ? <> · {item.groupingStrategy}</> : null}
+                    </div>
+                  </div>
+                  <StatusPill status={item.status ?? "UNKNOWN"} />
+                </button>
+              ))}
+            </div>
+          )}
+        </>
       )}
     </div>
   );
