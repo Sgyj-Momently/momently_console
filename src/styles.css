@@ -241,6 +241,11 @@ a.nav-item.active {
 }
 
 /* TipTap 말투 학습 에디터 */
+.voice-sample-editor-shell {
+  display: grid;
+  gap: 8px;
+}
+
 .voice-sample-editor {
   background: #fdfcfb;
   border: 1px solid var(--border);
@@ -308,6 +313,31 @@ a.nav-item.active {
 .voice-sample-editor .ProseMirror ol {
   margin: 6px 0;
   padding-left: 1.25rem;
+}
+
+.voice-sample-editor-notice {
+  align-items: center;
+  background: var(--warn-bg);
+  border: 1px solid var(--warn-border);
+  border-radius: 8px;
+  color: var(--warn-text);
+  display: flex;
+  font-size: 12px;
+  gap: 10px;
+  justify-content: space-between;
+  line-height: 1.45;
+  padding: 8px 10px;
+}
+
+.voice-sample-editor-notice button {
+  background: transparent;
+  border: 0;
+  color: inherit;
+  cursor: pointer;
+  flex-shrink: 0;
+  font: inherit;
+  font-weight: 800;
+  padding: 0;
 }
 
 input[type="text"],
@@ -1822,6 +1852,28 @@ input:-webkit-autofill:active {
   box-shadow: 0 1px 2px rgba(17,24,39,0.04);
 }
 
+.history-tools {
+  align-items: flex-end;
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+
+.history-search {
+  flex: 1;
+  margin: 0;
+  max-width: 520px;
+}
+
+.history-filter-row {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  justify-content: flex-end;
+}
+
 .history-item {
   align-items: center;
   background: none;
@@ -1897,6 +1949,10 @@ input:-webkit-autofill:active {
 .history-empty strong {
   color: var(--text);
   font-size: 15px;
+}
+
+.history-empty-compact {
+  padding: 32px 20px;
 }
 
 /* ── Status pill ─────────────────────────────────────── */
@@ -2117,6 +2173,16 @@ input:-webkit-autofill:active {
   color: var(--text-muted);
   font-size: 14px;
   margin: 0 0 32px;
+}
+
+.login-remember {
+  align-items: center;
+  color: var(--text-muted);
+  cursor: pointer;
+  display: inline-flex;
+  font-size: 13px;
+  gap: 8px;
+  margin-top: 2px;
 }
 
 .login-submit {
