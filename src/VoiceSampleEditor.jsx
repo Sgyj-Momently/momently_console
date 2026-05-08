@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useImperativeHandle, useMemo, useRef, forwardRef } from "react";
+import { useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState, forwardRef } from "react";
 import { EditorContent, useEditor } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
 import Placeholder from "@tiptap/extension-placeholder";
@@ -71,6 +71,7 @@ const VoiceSampleEditor = forwardRef(function VoiceSampleEditor(
   const editorRef = useRef(null);
   const debounceRef = useRef(null);
   const onMarkdownChangeRef = useRef(onMarkdownChange);
+  const [mediaError, setMediaError] = useState("");
   onMarkdownChangeRef.current = onMarkdownChange;
 
   const emitMarkdown = useCallback((ed) => {
@@ -82,6 +83,10 @@ const VoiceSampleEditor = forwardRef(function VoiceSampleEditor(
     debounceRef.current = setTimeout(() => {
       cb(md);
     }, 320);
+  }, []);
+
+  const showMediaError = useCallback((message) => {
+    setMediaError(message || "이미지를 처리하지 못했습니다.");
   }, []);
 
   const extensions = useMemo(
@@ -122,6 +127,7 @@ const VoiceSampleEditor = forwardRef(function VoiceSampleEditor(
           const imageItem = [...cd.items].find((it) => it.type.startsWith("image/"));
           if (imageItem) {
             event.preventDefault();
+            setMediaError("");
             const file = imageItem.getAsFile();
             if (!file) return true;
             compressImageToDataUrl(file)
@@ -130,7 +136,7 @@ const VoiceSampleEditor = forwardRef(function VoiceSampleEditor(
                 emitMarkdown(ed);
               })
               .catch((err) => {
-                window.alert(err?.message || "이미지를 붙여넣지 못했습니다.");
+                showMediaError(err?.message || "이미지를 붙여넣지 못했습니다.");
               });
             return true;
           }
@@ -144,13 +150,14 @@ const VoiceSampleEditor = forwardRef(function VoiceSampleEditor(
           const file = [...dt.files].find((f) => f.type.startsWith("image/"));
           if (!file) return false;
           event.preventDefault();
+          setMediaError("");
           compressImageToDataUrl(file)
             .then((dataUrl) => {
               ed.chain().focus().setImage({ src: dataUrl }).run();
               emitMarkdown(ed);
             })
             .catch((err) => {
-              window.alert(err?.message || "이미지를 놓지 못했습니다.");
+              showMediaError(err?.message || "이미지를 놓지 못했습니다.");
             });
           return true;
         },
@@ -165,7 +172,7 @@ const VoiceSampleEditor = forwardRef(function VoiceSampleEditor(
         emitMarkdown(ed);
       },
     },
-    [extensions, resetKey]
+    [extensions, resetKey, showMediaError]
   );
 
   useEffect(() => {
@@ -211,8 +218,16 @@ const VoiceSampleEditor = forwardRef(function VoiceSampleEditor(
   }
 
   return (
-    <div className={`voice-sample-editor ${disabled ? "voice-sample-editor--disabled" : ""}`}>
-      <EditorContent editor={editor} />
+    <div className="voice-sample-editor-shell">
+      <div className={`voice-sample-editor ${disabled ? "voice-sample-editor--disabled" : ""}`}>
+        <EditorContent editor={editor} />
+      </div>
+      {mediaError && (
+        <div className="voice-sample-editor-notice" role="status">
+          <span>{mediaError}</span>
+          <button type="button" onClick={() => setMediaError("")}>닫기</button>
+        </div>
+      )}
     </div>
   );
 });
