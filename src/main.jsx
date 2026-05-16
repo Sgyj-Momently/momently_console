@@ -7,6 +7,7 @@ import {
   Outlet,
   RouterProvider,
   useNavigate,
+  useRouteError,
 } from "react-router-dom";
 import {
   Activity,
@@ -34,6 +35,12 @@ import {
 import "./styles.css";
 import { apiOriginFromEnv, voiceOriginFromEnv } from "./apiOrigin.js";
 import { orchestratorNeedsBearer, shouldClearSessionOnUnauthorized } from "./orchestratorAuth.js";
+import {
+  clearActiveWorkflowId,
+  loadActiveWorkflowId,
+  saveActiveWorkflowId,
+  WORKFLOW_ID_RE,
+} from "./workflowSession.js";
 import VoiceSampleEditor from "./VoiceSampleEditor.jsx";
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -541,6 +548,13 @@ async function fetchWorkflows() {
 
 async function deleteWorkflowHistoryApi() {
   return apiRequest(orchPath("/api/v1/workflows"), {
+    method: "DELETE",
+    expectJson: false,
+  });
+}
+
+async function deleteWorkflowApi(workflowId) {
+  return apiRequest(orchPath(`/api/v1/workflows/${workflowId}`), {
     method: "DELETE",
     expectJson: false,
   });
@@ -1720,7 +1734,8 @@ function WritePage() {
   const [direction, setDirection] = useState("");
   const [selectedVoiceProfileId, setSelectedVoiceProfileId] = useState("기본");
   const [voiceProfiles, setVoiceProfiles] = useState(loadCachedVoiceProfiles);
-  const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [mediaSourceOpen, setMediaSourceOpen] = useState(false);
+  const [analysisOptionsOpen, setAnalysisOptionsOpen] = useState(false);
   const [groupingStrategy, setGroupingStrategy] = useState("LOCATION_BASED");
   const [timeWindowMinutes, setTimeWindowMinutes] = useState(90);
 
@@ -1793,6 +1808,7 @@ function WritePage() {
 
     const handleWorkflow = (data) => {
       setWorkflow(data);
+      saveActiveWorkflowId(data.workflowId);
       if (["COMPLETED", "FAILED"].includes(data.status)) {
         stopPolling();
         setPhase("done");
@@ -1830,6 +1846,40 @@ function WritePage() {
       stopStream();
     };
   }
+
+  useEffect(() => {
+    let cancelled = false;
+    const activeWorkflowId = loadActiveWorkflowId();
+    if (!activeWorkflowId) return undefined;
+
+    setBusy(true);
+    setError("");
+    fetchWorkflow(activeWorkflowId)
+      .then((data) => {
+        if (cancelled) return;
+        setWorkflow(data);
+        setProjectId(data.projectId || "");
+        setWriteStep(3);
+        if (isTerminalWorkflowStatus(data.status)) {
+          setPhase("done");
+        } else {
+          setPhase("running");
+          startPolling(activeWorkflowId);
+        }
+      })
+      .catch((e) => {
+        if (cancelled) return;
+        clearActiveWorkflowId();
+        setError(`이전 작업을 불러오지 못했습니다: ${e.message}`);
+      })
+      .finally(() => {
+        if (!cancelled) setBusy(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => () => stopPolling(), []);
 
@@ -1942,8 +1992,10 @@ function WritePage() {
         contentType,
         writingInstructions
       );
+      saveActiveWorkflowId(wf.workflowId);
       await runWorkflowApi(wf.workflowId);
       const updated = await fetchWorkflow(wf.workflowId);
+      saveActiveWorkflowId(updated.workflowId);
       setWorkflow(updated);
       setPhase("running");
       startPolling(wf.workflowId);
@@ -1961,6 +2013,7 @@ function WritePage() {
     try {
       await retryWorkflowApi(workflow.workflowId);
       const updated = await fetchWorkflow(workflow.workflowId);
+      saveActiveWorkflowId(updated.workflowId);
       setWorkflow(updated);
       setPhase("running");
       startPolling(workflow.workflowId);
@@ -1973,11 +2026,12 @@ function WritePage() {
 
   function handleReset() {
     stopPolling();
-      setUploadedFiles((prev) => {
-        prev.forEach((item) => URL.revokeObjectURL(item.url));
-        return [];
-      });
-      setUploadNotice("");
+    clearActiveWorkflowId();
+    setUploadedFiles((prev) => {
+      prev.forEach((item) => URL.revokeObjectURL(item.url));
+      return [];
+    });
+    setUploadNotice("");
     setPhase("form");
     setWriteStep(1);
     setWorkflow(null);
@@ -2141,7 +2195,8 @@ function WritePage() {
 
             {photoMode === "upload" ? (
               <>
-                <div
+                <button
+                  type="button"
                   className={`dropzone ${dragOver ? "drag-over" : ""}`}
                   onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
                   onDragLeave={() => setDragOver(false)}
@@ -2153,7 +2208,7 @@ function WritePage() {
                   <span>
                     {uploadLimits.allowedExtensions.map((ext) => ext.toUpperCase()).join(" · ")} 지원 · 최대 {uploadLimits.maxFiles}개
                   </span>
-                </div>
+                </button>
                 <input
                   ref={fileInputRef}
                   type="file"
@@ -2235,15 +2290,15 @@ function WritePage() {
             <button
               className="collapsible-header"
               style={{ borderTop: "none" }}
-              onClick={() => setAdvancedOpen((v) => !v)}
+              onClick={() => setMediaSourceOpen((v) => !v)}
               type="button"
             >
               <span className="flex-row" style={{ gap: 6 }}>
                 <Settings size={14} /> 서버에 준비된 미디어 묶음 쓰기
               </span>
-              {advancedOpen ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
+              {mediaSourceOpen ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
             </button>
-            {advancedOpen && (
+            {mediaSourceOpen && (
               <div className="collapsible-body">
                 <div className="alert alert-warn mt-8">
                   이미 서버 입력 폴더에 파일이 올라가 있는 경우에만 사용하세요.
@@ -2387,15 +2442,15 @@ function WritePage() {
             <button
               className="collapsible-header"
               style={{ borderTop: "none", paddingTop: 0 }}
-              onClick={() => setAdvancedOpen((v) => !v)}
+              onClick={() => setAnalysisOptionsOpen((v) => !v)}
               type="button"
             >
               <span className="flex-row" style={{ gap: 6 }}>
                 <Settings size={14} /> 분석 기준 조정
               </span>
-              {advancedOpen ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
+              {analysisOptionsOpen ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
             </button>
-            {advancedOpen && (
+            {analysisOptionsOpen && (
               <div className="collapsible-body advanced-grid">
                 <div className="field">
                   <label>사진 그룹화 기준</label>
@@ -2465,7 +2520,11 @@ function WritePage() {
           <span>
             {writeStep === 1 && "사진이나 동영상을 올리면 다음 단계로 갈 수 있습니다."}
             {writeStep === 2 && "기본값으로도 충분합니다. 필요한 것만 바꾸세요."}
-            {writeStep === 3 && "업로드 후 자동으로 프로젝트 ID를 만들고 워크플로를 실행합니다."}
+            {writeStep === 3 && (
+              photoMode === "upload"
+                ? "업로드 후 자동으로 프로젝트 ID를 만들고 워크플로를 실행합니다."
+                : "입력한 서버 묶음 ID로 워크플로를 실행합니다."
+            )}
           </span>
         </div>
         <div className="start-actions">
@@ -2794,9 +2853,6 @@ function TonePage() {
 
 // ── History Page ──────────────────────────────────────────────────────────────
 
-/** 서버(UUID) 워크플로 id; 로컬 기록 깨짐 시 401/400 혼선을 줄이기 위해 검사한다 */
-const HISTORY_WORKFLOW_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
 function HistoryPage() {
   const [history, setHistory] = useState([]);
   const [selected, setSelected] = useState(null);
@@ -2811,6 +2867,9 @@ function HistoryPage() {
   const [historyQuery, setHistoryQuery] = useState("");
   const [historyStatusFilter, setHistoryStatusFilter] = useState("ALL");
   const [confirmClearHistory, setConfirmClearHistory] = useState(false);
+  const [clearingHistory, setClearingHistory] = useState(false);
+  const [deletingWorkflowId, setDeletingWorkflowId] = useState("");
+  const [confirmDeleteWorkflowId, setConfirmDeleteWorkflowId] = useState("");
   const detailPollRef = useRef(null);
   const filteredHistory = history.filter((item) => {
     const query = historyQuery.trim().toLowerCase();
@@ -2890,6 +2949,7 @@ function HistoryPage() {
     setLoadingHistory(true);
     setHistoryError("");
     setConfirmClearHistory(false);
+    setConfirmDeleteWorkflowId("");
     try {
       const data = await fetchWorkflows();
       setHistory(Array.isArray(data) ? data : []);
@@ -2914,10 +2974,12 @@ function HistoryPage() {
       return;
     }
     setHistoryError("");
+    setClearingHistory(true);
     try {
       await deleteWorkflowHistoryApi();
       stopDetailTracking();
       clearHistory();
+      clearActiveWorkflowId();
       setHistory([]);
       setSelected(null);
       setWorkflow(null);
@@ -2925,6 +2987,36 @@ function HistoryPage() {
       setConfirmClearHistory(false);
     } catch (e) {
       setHistoryError(e.message);
+    } finally {
+      setClearingHistory(false);
+    }
+  }
+
+  async function deleteHistoryItem(item) {
+    const workflowId = item?.workflowId ?? item?.workflow_id;
+    if (!workflowId) return;
+    if (confirmDeleteWorkflowId !== workflowId) {
+      setConfirmDeleteWorkflowId(workflowId);
+      return;
+    }
+    setDeletingWorkflowId(workflowId);
+    setHistoryError("");
+    try {
+      await deleteWorkflowApi(workflowId);
+      if (loadActiveWorkflowId() === workflowId) {
+        clearActiveWorkflowId();
+      }
+      setHistory((prev) => prev.filter((entry) => (entry.workflowId ?? entry.workflow_id) !== workflowId));
+      if ((selected?.workflowId ?? selected?.workflow_id) === workflowId) {
+        stopDetailTracking();
+        setSelected(null);
+        setWorkflow(null);
+      }
+      setConfirmDeleteWorkflowId("");
+    } catch (e) {
+      setHistoryError(e.message);
+    } finally {
+      setDeletingWorkflowId("");
     }
   }
 
@@ -2937,7 +3029,7 @@ function HistoryPage() {
     try {
       const rawId = item.workflowId ?? item.workflow_id;
       const wid = typeof rawId === "string" ? rawId.trim() : rawId != null ? String(rawId).trim() : "";
-      if (!HISTORY_WORKFLOW_ID_RE.test(wid)) {
+      if (!WORKFLOW_ID_RE.test(wid)) {
         throw new Error("저장된 작업 ID가 올바르지 않습니다. 브라우저 작업 기록을 비우거나 새 작업부터 다시 시도해 주세요.");
       }
       const data = await fetchWorkflow(wid);
@@ -2992,6 +3084,17 @@ function HistoryPage() {
                 <button className="btn btn-primary btn-sm" type="button" onClick={retrySelectedWorkflow} disabled={detailBusy}>
                   {detailBusy ? <Loader2 className="spin" size={14} /> : <RefreshCw size={14} />}
                   재시도
+                </button>
+              )}
+              {workflow && (
+                <button
+                  className={`btn ${confirmDeleteWorkflowId === workflow.workflowId ? "btn-danger" : "btn-ghost"} btn-sm`}
+                  type="button"
+                  onClick={() => deleteHistoryItem(workflow)}
+                  disabled={deletingWorkflowId === workflow.workflowId}
+                >
+                  {deletingWorkflowId === workflow.workflowId ? <Loader2 className="spin" size={14} /> : <Trash2 size={14} />}
+                  {confirmDeleteWorkflowId === workflow.workflowId ? "기록 삭제 확인" : "기록 삭제"}
                 </button>
               )}
               {workflow && <StatusPill status={workflow.status} />}
@@ -3092,8 +3195,10 @@ function HistoryPage() {
                 type="button"
                 className={`btn ${confirmClearHistory ? "btn-danger" : "btn-ghost"} btn-sm`}
                 onClick={clearAllHistory}
+                disabled={clearingHistory}
               >
-                <Trash2 size={14} /> {confirmClearHistory ? "정말 삭제" : "전체 삭제"}
+                {clearingHistory ? <Loader2 className="spin" size={14} /> : <Trash2 size={14} />}
+                {clearingHistory ? "삭제 중" : confirmClearHistory ? "정말 삭제" : "전체 삭제"}
               </button>
             )}
           </div>
@@ -3151,10 +3256,18 @@ function HistoryPage() {
           ) : (
             <div className="history-list">
               {filteredHistory.map((item) => (
-                <button
+                <div
                   key={item.workflowId}
                   className="history-item"
+                  role="button"
+                  tabIndex={0}
                   onClick={() => openItem(item)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" || event.key === " ") {
+                      event.preventDefault();
+                      openItem(item);
+                    }
+                  }}
                 >
                   <div className="history-item-icon">
                     <FileText size={18} />
@@ -3166,8 +3279,24 @@ function HistoryPage() {
                       {item.groupingStrategy ? <> · {item.groupingStrategy}</> : null}
                     </div>
                   </div>
-                  <StatusPill status={item.status ?? "UNKNOWN"} />
-                </button>
+                  <div className="history-item-actions">
+                    <StatusPill status={item.status ?? "UNKNOWN"} />
+                    <button
+                      type="button"
+                      className={`history-delete-btn ${confirmDeleteWorkflowId === item.workflowId ? "confirm" : ""}`}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        deleteHistoryItem(item);
+                      }}
+                      disabled={deletingWorkflowId === item.workflowId}
+                    >
+                      {deletingWorkflowId === item.workflowId
+                        ? <Loader2 className="spin" size={13} />
+                        : <Trash2 size={13} />}
+                      <span>{confirmDeleteWorkflowId === item.workflowId ? "확인" : "삭제"}</span>
+                    </button>
+                  </div>
+                </div>
               ))}
             </div>
           )}
@@ -3433,8 +3562,55 @@ function Layout() {
   );
 }
 
+function AppErrorView({ title = "화면을 불러오지 못했습니다", detail }) {
+  return (
+    <div className="fatal-page">
+      <div className="fatal-panel">
+        <Sparkles size={24} />
+        <h2>{title}</h2>
+        <p>{detail || "잠시 후 다시 시도해 주세요. 진행 중이던 서버 작업은 작업 기록에서 다시 확인할 수 있습니다."}</p>
+        <div className="flex-row">
+          <button type="button" className="btn btn-primary" onClick={() => window.location.reload()}>
+            <RefreshCw size={15} /> 새로고침
+          </button>
+          <button type="button" className="btn btn-secondary" onClick={() => { window.location.href = "/history"; }}>
+            <FileText size={15} /> 작업 기록
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+class AppErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { error: null };
+  }
+
+  static getDerivedStateFromError(error) {
+    return { error };
+  }
+
+  componentDidCatch(error) {
+    console.error("[Momently] 화면 렌더링 오류:", error);
+  }
+
+  render() {
+    if (this.state.error) {
+      return <AppErrorView detail={this.state.error?.message} />;
+    }
+    return this.props.children;
+  }
+}
+
+function RouteErrorPage() {
+  const error = useRouteError();
+  return <AppErrorView detail={error?.message || "요청한 화면을 찾지 못했거나 라우팅 중 오류가 발생했습니다."} />;
+}
+
 const router = createBrowserRouter([
-  { path: "/login", element: <LoginPage /> },
+  { path: "/login", element: <LoginPage />, errorElement: <RouteErrorPage /> },
   {
     path: "/",
     element: (
@@ -3442,6 +3618,7 @@ const router = createBrowserRouter([
         <Layout />
       </RequireAuth>
     ),
+    errorElement: <RouteErrorPage />,
     children: [
       { index: true, element: <WritePage /> },
       { path: "tone", element: <TonePage /> },
@@ -3451,4 +3628,8 @@ const router = createBrowserRouter([
   },
 ]);
 
-createRoot(document.getElementById("root")).render(<RouterProvider router={router} />);
+createRoot(document.getElementById("root")).render(
+  <AppErrorBoundary>
+    <RouterProvider router={router} />
+  </AppErrorBoundary>
+);
