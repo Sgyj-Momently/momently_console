@@ -152,6 +152,40 @@ a.nav-item.active {
   overflow-y: auto;
 }
 
+.fatal-page {
+  align-items: center;
+  background: var(--bg);
+  display: flex;
+  min-height: 100vh;
+  padding: 24px;
+}
+
+.fatal-panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 12px 30px rgba(17,24,39,0.08);
+  color: var(--text);
+  margin: 0 auto;
+  max-width: 520px;
+  padding: 28px;
+}
+
+.fatal-panel svg {
+  color: var(--brand);
+}
+
+.fatal-panel h2 {
+  font-size: 22px;
+  margin: 12px 0 8px;
+}
+
+.fatal-panel p {
+  color: var(--text-muted);
+  line-height: 1.6;
+  margin: 0 0 18px;
+}
+
 .page {
   max-width: 900px;
   margin: 0 auto;
@@ -343,6 +377,7 @@ a.nav-item.active {
 input[type="text"],
 input[type="number"],
 input[type="password"],
+input[type="url"],
 select,
 textarea {
   background: #FFFFFF;
@@ -357,8 +392,19 @@ textarea {
 input[type="text"],
 input[type="number"],
 input[type="password"],
+input[type="url"],
 select {
   height: 38px;
+}
+
+.input-action-row {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.input-action-row .btn {
+  white-space: nowrap;
 }
 
 textarea {
@@ -504,24 +550,33 @@ input:-webkit-autofill:active {
 
 .dropzone {
   align-items: center;
+  background: transparent;
   border: 2px dashed var(--border);
   border-radius: 10px;
   color: var(--text-muted);
   cursor: pointer;
   display: flex;
   flex-direction: column;
+  font: inherit;
   gap: 10px;
   justify-content: center;
   min-height: 140px;
   padding: 20px;
   text-align: center;
   transition: background 150ms ease, border-color 150ms ease;
+  width: 100%;
 }
 
 .dropzone:hover,
-.dropzone.drag-over {
+.dropzone.drag-over,
+.dropzone:focus-visible {
   background: #ECFFFC;
   border-color: var(--brand);
+}
+
+.dropzone:focus-visible {
+  outline: 3px solid rgba(0, 175, 160, 0.18);
+  outline-offset: 2px;
 }
 
 .dropzone p {
@@ -1892,8 +1947,14 @@ input:-webkit-autofill:active {
   border-bottom: none;
 }
 
-.history-item:hover {
+.history-item:hover,
+.history-item:focus-visible {
   background: #F8FAFB;
+}
+
+.history-item:focus-visible {
+  outline: 3px solid rgba(0, 175, 160, 0.18);
+  outline-offset: -3px;
 }
 
 .history-item-icon {
@@ -1925,6 +1986,40 @@ input:-webkit-autofill:active {
   color: var(--text-muted);
   font-size: 12px;
   margin-top: 2px;
+}
+
+.history-item-actions {
+  align-items: center;
+  display: flex;
+  flex-shrink: 0;
+  gap: 8px;
+}
+
+.history-delete-btn {
+  align-items: center;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--text-muted);
+  cursor: pointer;
+  display: inline-flex;
+  font-size: 12px;
+  font-weight: 800;
+  gap: 4px;
+  height: 28px;
+  padding: 0 9px;
+}
+
+.history-delete-btn:hover:not(:disabled) {
+  background: #FFF1F1;
+  border-color: var(--error-border);
+  color: var(--error-text);
+}
+
+.history-delete-btn.confirm {
+  background: var(--error-bg);
+  border-color: var(--error-border);
+  color: var(--error-text);
 }
 
 .history-empty {
@@ -2161,6 +2256,39 @@ input:-webkit-autofill:active {
   width: 100%;
 }
 
+.login-mode-tabs {
+  background: var(--surface-subtle);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px;
+  margin-bottom: 24px;
+  padding: 4px;
+}
+
+.login-mode-tabs button {
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 700;
+  height: 34px;
+}
+
+.login-mode-tabs button.active {
+  background: var(--surface);
+  box-shadow: 0 1px 3px rgba(15, 23, 42, 0.12);
+  color: var(--text);
+}
+
+.login-mode-tabs button:disabled {
+  cursor: not-allowed;
+  opacity: 0.7;
+}
+
 .login-form-title {
   color: var(--text);
   font-size: 24px;
@@ -2264,6 +2392,7 @@ input:-webkit-autofill:active {
   }
 
   .sidebar {
+    box-shadow: 0 -8px 24px rgba(17,24,39,0.18);
     order: 2;
     position: fixed;
     bottom: 0;
@@ -2273,7 +2402,7 @@ input:-webkit-autofill:active {
     height: auto;
     flex-direction: row;
     z-index: 100;
-    padding: 0;
+    padding: 0 0 env(safe-area-inset-bottom);
   }
 
   /* Remove the bottom accent bar on mobile since sidebar is horizontal */
@@ -2290,7 +2419,12 @@ input:-webkit-autofill:active {
     padding: 6px 8px;
     gap: 4px;
     overflow-x: auto;
+    scrollbar-width: none;
     width: 100%;
+  }
+
+  .sidebar-nav::-webkit-scrollbar {
+    display: none;
   }
 
   .nav-item,
@@ -2307,7 +2441,7 @@ input:-webkit-autofill:active {
   }
 
   .content {
-    padding-bottom: 70px;
+    padding-bottom: calc(78px + env(safe-area-inset-bottom));
   }
 
   .page,
@@ -2334,6 +2468,10 @@ input:-webkit-autofill:active {
     width: 100%;
   }
 
+  .input-action-row {
+    grid-template-columns: 1fr;
+  }
+
   .write-hero {
     grid-template-columns: 1fr;
   }
@@ -2351,6 +2489,15 @@ input:-webkit-autofill:active {
 
   .workflow-summary-strip {
     grid-template-columns: 1fr;
+  }
+
+  .history-item {
+    align-items: flex-start;
+  }
+
+  .history-item-actions {
+    align-items: flex-end;
+    flex-direction: column;
   }
 
   .tone-grid {

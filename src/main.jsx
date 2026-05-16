@@ -7,6 +7,7 @@ import {
   Outlet,
   RouterProvider,
   useNavigate,
+  useRouteError,
 } from "react-router-dom";
 import {
   Activity,
@@ -18,6 +19,7 @@ import {
   Download,
   FileText,
   Image,
+  Link as LinkIcon,
   Loader2,
   LogOut,
   Palette,
@@ -34,6 +36,12 @@ import {
 import "./styles.css";
 import { apiOriginFromEnv, voiceOriginFromEnv } from "./apiOrigin.js";
 import { orchestratorNeedsBearer, shouldClearSessionOnUnauthorized } from "./orchestratorAuth.js";
+import {
+  clearActiveWorkflowId,
+  loadActiveWorkflowId,
+  saveActiveWorkflowId,
+  WORKFLOW_ID_RE,
+} from "./workflowSession.js";
 import VoiceSampleEditor from "./VoiceSampleEditor.jsx";
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -352,8 +360,8 @@ async function uploadMultipartJson(url, formData) {
   return JSON.parse(text);
 }
 
-async function loginApi(username, password) {
-  const path = orchPath("/api/v1/auth/login");
+async function postAuthApi(pathname, payload, actionLabel) {
+  const path = orchPath(pathname);
   const resolved =
     typeof window !== "undefined" && typeof path === "string" && path.startsWith("/")
       ? `${window.location.origin}${path}`
@@ -364,10 +372,10 @@ async function loginApi(username, password) {
     response = await fetch(path, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ username, password }),
+      body: JSON.stringify(payload),
     });
   } catch (err) {
-    console.error("[Momently] 로그인 요청 실패:", resolved, err);
+    console.error(`[Momently] ${actionLabel} 요청 실패:`, resolved, err);
     const devHint = import.meta.env.DEV ? " 게이트(기본 :18580)·`vite.config.js` /api 프록시를 확인하세요." : "";
     throw new Error(
       `서버에 연결하지 못했습니다. (${resolved}) 게이트와 오케스트레이터 상태, 브라우저 네트워크 탭을 확인하세요.${devHint}`
@@ -387,6 +395,14 @@ async function loginApi(username, password) {
     throw new Error(detail || `${response.status} ${response.statusText}`);
   }
   return JSON.parse(text);
+}
+
+async function loginApi(username, password) {
+  return postAuthApi("/api/v1/auth/login", { username, password }, "로그인");
+}
+
+async function registerApi(username, password, inviteCode) {
+  return postAuthApi("/api/v1/auth/register", { username, password, inviteCode }, "회원가입");
 }
 
 async function uploadMediaApi(files) {
@@ -546,6 +562,13 @@ async function deleteWorkflowHistoryApi() {
   });
 }
 
+async function deleteWorkflowApi(workflowId) {
+  return apiRequest(orchPath(`/api/v1/workflows/${workflowId}`), {
+    method: "DELETE",
+    expectJson: false,
+  });
+}
+
 async function fetchArtifact(workflowId, type) {
   return apiRequest(orchPath(`/api/v1/workflows/${workflowId}/artifacts/${type}`));
 }
@@ -608,6 +631,14 @@ async function addVoiceSampleApi(profileId, title, content) {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ title, content }),
+  });
+}
+
+async function addVoiceSampleFromUrlApi(profileId, url) {
+  return apiRequest(voicePath(`/api/v1/voice-profiles/${profileId}/samples/from-url`), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ url }),
   });
 }
 
@@ -912,22 +943,34 @@ function RequireAuth({ children }) {
 
 function LoginPage() {
   const navigate = useNavigate();
+  const [authMode, setAuthMode] = useState("login");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
+  const [inviteCode, setInviteCode] = useState("");
   const [rememberLogin, setRememberLogin] = useState(false);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+
+  const isRegister = authMode === "register";
+
+  function switchMode(nextMode) {
+    setAuthMode(nextMode);
+    setError("");
+  }
 
   async function handleSubmit(e) {
     e.preventDefault();
     setBusy(true);
     setError("");
     try {
-      const data = await loginApi(username.trim(), password);
+      const trimmedUsername = username.trim();
+      const data = isRegister
+        ? await registerApi(trimmedUsername, password, inviteCode.trim())
+        : await loginApi(trimmedUsername, password);
       persistAccessToken(data.accessToken, rememberLogin);
       navigate("/", { replace: true });
     } catch (err) {
-      setError(err?.message || "로그인에 실패했습니다.");
+      setError(err?.message || (isRegister ? "회원가입에 실패했습니다." : "로그인에 실패했습니다."));
     } finally {
       setBusy(false);
     }
@@ -969,8 +1012,29 @@ function LoginPage() {
       {/* Right panel — form */}
       <div className="login-right">
         <div className="login-form-wrap">
-          <h3 className="login-form-title">콘솔 로그인</h3>
-          <p className="login-form-sub">계정 정보를 입력해 주세요</p>
+          <div className="login-mode-tabs" role="tablist" aria-label="인증 방식">
+            <button
+              type="button"
+              className={authMode === "login" ? "active" : ""}
+              onClick={() => switchMode("login")}
+              disabled={busy}
+            >
+              로그인
+            </button>
+            <button
+              type="button"
+              className={authMode === "register" ? "active" : ""}
+              onClick={() => switchMode("register")}
+              disabled={busy}
+            >
+              회원가입
+            </button>
+          </div>
+
+          <h3 className="login-form-title">{isRegister ? "콘솔 회원가입" : "콘솔 로그인"}</h3>
+          <p className="login-form-sub">
+            {isRegister ? "초대 코드를 가진 사용자만 계정을 만들 수 있어요" : "계정 정보를 입력해 주세요"}
+          </p>
 
           <form onSubmit={handleSubmit}>
             <div className="field">
@@ -999,6 +1063,21 @@ function LoginPage() {
                 required
               />
             </div>
+            {isRegister && (
+              <div className="field">
+                <label htmlFor="login-invite">초대 코드</label>
+                <input
+                  id="login-invite"
+                  type="password"
+                  autoComplete="off"
+                  value={inviteCode}
+                  onChange={(e) => setInviteCode(e.target.value)}
+                  placeholder="초대 코드"
+                  disabled={busy}
+                  required
+                />
+              </div>
+            )}
 
             <label className="login-remember">
               <input
@@ -1018,7 +1097,7 @@ function LoginPage() {
               disabled={busy}
             >
               {busy ? <Loader2 className="spin" size={18} /> : null}
-              {busy ? "로그인 중..." : "로그인"}
+              {busy ? (isRegister ? "가입 중..." : "로그인 중...") : (isRegister ? "가입하고 시작" : "로그인")}
             </button>
           </form>
         </div>
@@ -1720,7 +1799,8 @@ function WritePage() {
   const [direction, setDirection] = useState("");
   const [selectedVoiceProfileId, setSelectedVoiceProfileId] = useState("기본");
   const [voiceProfiles, setVoiceProfiles] = useState(loadCachedVoiceProfiles);
-  const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [mediaSourceOpen, setMediaSourceOpen] = useState(false);
+  const [analysisOptionsOpen, setAnalysisOptionsOpen] = useState(false);
   const [groupingStrategy, setGroupingStrategy] = useState("LOCATION_BASED");
   const [timeWindowMinutes, setTimeWindowMinutes] = useState(90);
 
@@ -1737,11 +1817,13 @@ function WritePage() {
   const [workflow, setWorkflow] = useState(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [startMsg, setStartMsg] = useState("");
   const [artifactKey, setArtifactKey] = useState(0);
   const [connectionMode, setConnectionMode] = useState("idle");
 
   const fileInputRef = useRef(null);
   const pollRef = useRef(null);
+  const resultCardRef = useRef(null);
 
   const allVoiceProfiles = [
     { id: "기본", name: "기본", description: "기본 warm_blog 스타일", sample_preview: "" },
@@ -1774,6 +1856,16 @@ function WritePage() {
       .catch(() => setUploadLimits(DEFAULT_UPLOAD_LIMITS));
   }, []);
 
+  useEffect(() => {
+    if (phase === "done" && workflow?.status === "COMPLETED") {
+      const t = setTimeout(() => {
+        resultCardRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+      }, 120);
+      return () => clearTimeout(t);
+    }
+    return undefined;
+  }, [phase, workflow?.status]);
+
   function stopPolling() {
     if (pollRef.current) {
       if (typeof pollRef.current === "function") {
@@ -1793,6 +1885,7 @@ function WritePage() {
 
     const handleWorkflow = (data) => {
       setWorkflow(data);
+      saveActiveWorkflowId(data.workflowId);
       if (["COMPLETED", "FAILED"].includes(data.status)) {
         stopPolling();
         setPhase("done");
@@ -1830,6 +1923,40 @@ function WritePage() {
       stopStream();
     };
   }
+
+  useEffect(() => {
+    let cancelled = false;
+    const activeWorkflowId = loadActiveWorkflowId();
+    if (!activeWorkflowId) return undefined;
+
+    setBusy(true);
+    setError("");
+    fetchWorkflow(activeWorkflowId)
+      .then((data) => {
+        if (cancelled) return;
+        setWorkflow(data);
+        setProjectId(data.projectId || "");
+        setWriteStep(3);
+        if (isTerminalWorkflowStatus(data.status)) {
+          setPhase("done");
+        } else {
+          setPhase("running");
+          startPolling(activeWorkflowId);
+        }
+      })
+      .catch((e) => {
+        if (cancelled) return;
+        clearActiveWorkflowId();
+        setError(`이전 작업을 불러오지 못했습니다: ${e.message}`);
+      })
+      .finally(() => {
+        if (!cancelled) setBusy(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => () => stopPolling(), []);
 
@@ -1923,11 +2050,14 @@ function WritePage() {
           return;
         }
         const thumbnails = uploadedFiles.slice();
+        setStartMsg(`사진·동영상 ${uploadedFiles.length}개 업로드 중…`);
         const up = await uploadMediaApi(uploadedFiles.map((entry) => entry.file));
         effectiveProjectId = up.projectId;
         thumbnails.forEach((item) => URL.revokeObjectURL(item.url));
         setUploadedFiles([]);
       }
+
+      setStartMsg("워크플로를 만들고 파이프라인을 실행하는 중…");
 
       const writingInstructions = [
         contentType ? `글 종류: ${contentType}` : "",
@@ -1942,8 +2072,10 @@ function WritePage() {
         contentType,
         writingInstructions
       );
+      saveActiveWorkflowId(wf.workflowId);
       await runWorkflowApi(wf.workflowId);
       const updated = await fetchWorkflow(wf.workflowId);
+      saveActiveWorkflowId(updated.workflowId);
       setWorkflow(updated);
       setPhase("running");
       startPolling(wf.workflowId);
@@ -1951,6 +2083,7 @@ function WritePage() {
       setError(e.message);
     } finally {
       setBusy(false);
+      setStartMsg("");
     }
   }
 
@@ -1961,6 +2094,7 @@ function WritePage() {
     try {
       await retryWorkflowApi(workflow.workflowId);
       const updated = await fetchWorkflow(workflow.workflowId);
+      saveActiveWorkflowId(updated.workflowId);
       setWorkflow(updated);
       setPhase("running");
       startPolling(workflow.workflowId);
@@ -1973,11 +2107,12 @@ function WritePage() {
 
   function handleReset() {
     stopPolling();
-      setUploadedFiles((prev) => {
-        prev.forEach((item) => URL.revokeObjectURL(item.url));
-        return [];
-      });
-      setUploadNotice("");
+    clearActiveWorkflowId();
+    setUploadedFiles((prev) => {
+      prev.forEach((item) => URL.revokeObjectURL(item.url));
+      return [];
+    });
+    setUploadNotice("");
     setPhase("form");
     setWriteStep(1);
     setWorkflow(null);
@@ -2038,7 +2173,7 @@ function WritePage() {
 
         {phase === "done" && workflow?.status === "COMPLETED" && (
           <>
-            <div className="card">
+            <div className="card" ref={resultCardRef}>
               <div className="card-title">
                 <FileText size={14} /> 결과물
               </div>
@@ -2141,7 +2276,8 @@ function WritePage() {
 
             {photoMode === "upload" ? (
               <>
-                <div
+                <button
+                  type="button"
                   className={`dropzone ${dragOver ? "drag-over" : ""}`}
                   onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
                   onDragLeave={() => setDragOver(false)}
@@ -2153,7 +2289,7 @@ function WritePage() {
                   <span>
                     {uploadLimits.allowedExtensions.map((ext) => ext.toUpperCase()).join(" · ")} 지원 · 최대 {uploadLimits.maxFiles}개
                   </span>
-                </div>
+                </button>
                 <input
                   ref={fileInputRef}
                   type="file"
@@ -2235,15 +2371,15 @@ function WritePage() {
             <button
               className="collapsible-header"
               style={{ borderTop: "none" }}
-              onClick={() => setAdvancedOpen((v) => !v)}
+              onClick={() => setMediaSourceOpen((v) => !v)}
               type="button"
             >
               <span className="flex-row" style={{ gap: 6 }}>
                 <Settings size={14} /> 서버에 준비된 미디어 묶음 쓰기
               </span>
-              {advancedOpen ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
+              {mediaSourceOpen ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
             </button>
-            {advancedOpen && (
+            {mediaSourceOpen && (
               <div className="collapsible-body">
                 <div className="alert alert-warn mt-8">
                   이미 서버 입력 폴더에 파일이 올라가 있는 경우에만 사용하세요.
@@ -2387,15 +2523,15 @@ function WritePage() {
             <button
               className="collapsible-header"
               style={{ borderTop: "none", paddingTop: 0 }}
-              onClick={() => setAdvancedOpen((v) => !v)}
+              onClick={() => setAnalysisOptionsOpen((v) => !v)}
               type="button"
             >
               <span className="flex-row" style={{ gap: 6 }}>
                 <Settings size={14} /> 분석 기준 조정
               </span>
-              {advancedOpen ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
+              {analysisOptionsOpen ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
             </button>
-            {advancedOpen && (
+            {analysisOptionsOpen && (
               <div className="collapsible-body advanced-grid">
                 <div className="field">
                   <label>사진 그룹화 기준</label>
@@ -2463,9 +2599,19 @@ function WritePage() {
             {writeStep === 3 && (photoMode === "upload" ? `${uploadedFiles.length}개 미디어로 시작` : "서버 묶음 ID로 시작")}
           </strong>
           <span>
-            {writeStep === 1 && "사진이나 동영상을 올리면 다음 단계로 갈 수 있습니다."}
-            {writeStep === 2 && "기본값으로도 충분합니다. 필요한 것만 바꾸세요."}
-            {writeStep === 3 && "업로드 후 자동으로 프로젝트 ID를 만들고 워크플로를 실행합니다."}
+            {busy && startMsg ? (
+              <span style={{ color: "var(--brand)", fontWeight: 700 }}>{startMsg}</span>
+            ) : (
+              <>
+                {writeStep === 1 && "사진이나 동영상을 올리면 다음 단계로 갈 수 있습니다."}
+                {writeStep === 2 && "기본값으로도 충분합니다. 필요한 것만 바꾸세요."}
+                {writeStep === 3 && (
+                  photoMode === "upload"
+                    ? "업로드 후 자동으로 프로젝트 ID를 만들고 워크플로를 실행합니다."
+                    : "입력한 서버 묶음 ID로 워크플로를 실행합니다."
+                )}
+              </>
+            )}
           </span>
         </div>
         <div className="start-actions">
@@ -2508,10 +2654,15 @@ function TonePage() {
   const [formName, setFormName] = useState("");
   const [formDesc, setFormDesc] = useState("");
   const [selectedProfileId, setSelectedProfileId] = useState("");
+  const [sampleMode, setSampleMode] = useState("url");
   const [sampleTitle, setSampleTitle] = useState("");
+  const [sampleUrl, setSampleUrl] = useState("");
   const [sampleMarkdown, setSampleMarkdown] = useState("");
   const sampleEditorRef = useRef(null);
+  const exampleCardRef = useRef(null);
   const [loading, setLoading] = useState(false);
+  const [loadingMsg, setLoadingMsg] = useState("");
+  const [statusMsg, setStatusMsg] = useState("");
   const [error, setError] = useState("");
 
   const selectedProfile = profiles.find((profile) => profile.id === selectedProfileId) ?? profiles[0];
@@ -2538,7 +2689,23 @@ function TonePage() {
 
   useEffect(() => {
     setSampleMarkdown("");
+    setSampleUrl("");
+    setSampleTitle("");
+    setStatusMsg("");
+    setError("");
   }, [selectedProfileId]);
+
+  function announceLearned(updated) {
+    const hasExample = !!String(updated?.example_paragraph || "").trim();
+    setStatusMsg(
+      hasExample
+        ? "말투 학습 완료! 아래에서 학습된 말투로 쓴 예시 글을 확인하세요."
+        : "샘플은 저장됐지만 예시 글이 아직 만들어지지 않았습니다. Ollama 상태를 확인한 뒤 「예시 글 생성」을 눌러 보세요."
+    );
+    setTimeout(() => {
+      exampleCardRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+    }, 80);
+  }
 
   async function handleSave() {
     if (!formName.trim()) return;
@@ -2563,6 +2730,8 @@ function TonePage() {
     const body = sampleEditorRef.current?.getMarkdown?.()?.trim() ?? sampleMarkdown.trim();
     if (!selectedProfile || !body) return;
     setLoading(true);
+    setLoadingMsg("말투를 분석하고 예시 글을 만드는 중입니다…");
+    setStatusMsg("");
     setError("");
     try {
       const updated = await addVoiceSampleApi(selectedProfile.id, sampleTitle, body);
@@ -2570,28 +2739,56 @@ function TonePage() {
       setProfiles(next);
       saveCachedVoiceProfiles(next);
       setSampleTitle("");
+      setSampleUrl("");
       setSampleMarkdown("");
       sampleEditorRef.current?.clear?.();
+      announceLearned(updated);
     } catch (e) {
       setError(e.message);
     } finally {
       setLoading(false);
+      setLoadingMsg("");
+    }
+  }
+
+  async function handleAddSampleFromUrl() {
+    if (!selectedProfile || !sampleUrl.trim()) return;
+    setLoading(true);
+    setLoadingMsg("블로그 본문을 가져와 말투를 분석하는 중입니다…");
+    setStatusMsg("");
+    setError("");
+    try {
+      const updated = await addVoiceSampleFromUrlApi(selectedProfile.id, sampleUrl.trim());
+      const next = profiles.map((profile) => profile.id === updated.id ? updated : profile);
+      setProfiles(next);
+      saveCachedVoiceProfiles(next);
+      setSampleUrl("");
+      announceLearned(updated);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setLoading(false);
+      setLoadingMsg("");
     }
   }
 
   async function handleAnalyze() {
     if (!selectedProfile) return;
     setLoading(true);
+    setLoadingMsg("말투를 다시 분석하고 예시 글을 만드는 중입니다…");
+    setStatusMsg("");
     setError("");
     try {
       const updated = await analyzeVoiceProfileApi(selectedProfile.id);
       const next = profiles.map((profile) => profile.id === updated.id ? updated : profile);
       setProfiles(next);
       saveCachedVoiceProfiles(next);
+      announceLearned(updated);
     } catch (e) {
       setError(e.message);
     } finally {
       setLoading(false);
+      setLoadingMsg("");
     }
   }
 
@@ -2602,7 +2799,7 @@ function TonePage() {
       <div className="page-header">
         <h2>말투 학습</h2>
         <p>
-          평소에 쓴 글을 붙여 넣어 분석하면, AI가 <strong>방금 학습한 말투</strong>만 골라서 짧은 블로그 예시 글을 새로 써서 이 화면에 보여 줍니다 (가상 소재·내용입니다).
+네이버 블로그 URL을 넣거나 평소에 쓴 글을 붙여 넣으면, AI가 <strong>그 말투</strong>만 골라 짧은 예시 글을 새로 써서 바로 아래에 보여 줍니다 (가상 소재·내용입니다).
         </p>
       </div>
 
@@ -2706,42 +2903,107 @@ function TonePage() {
         <>
           <div className="card">
             <div className="card-title"><FileText size={14} /> 학습 데이터 추가</div>
-            <div className="field">
-              <label>샘플 제목</label>
-              <input
-                type="text"
-                value={sampleTitle}
-                onChange={(e) => setSampleTitle(e.target.value)}
-                placeholder="예: 2026 제주 카페 후기"
-              />
+            <div className="mode-toggle">
+              <button
+                type="button"
+                className={sampleMode === "url" ? "active" : ""}
+                onClick={() => { setSampleMode("url"); setStatusMsg(""); }}
+              >
+                URL로 가져오기
+              </button>
+              <button
+                type="button"
+                className={sampleMode === "paste" ? "active" : ""}
+                onClick={() => { setSampleMode("paste"); setStatusMsg(""); }}
+              >
+                직접 붙여넣기
+              </button>
             </div>
-            <div className="field">
-              <label>평소에 쓴 글</label>
-              <p className="field-hint">
-                TipTap 에디터에서 블로그 글을 붙여 넣을 수 있습니다. 사진·캡처는 JPEG로 줄여{" "}
-                <code>![](data:…)</code> 마크다운으로 변환된 뒤 서버에 저장됩니다. 외부 URL 이미지는 그대로 링크로
-                남습니다.
+
+            {sampleMode === "url" ? (
+              <div className="field" style={{ marginBottom: 0 }}>
+                <label>네이버 블로그 URL</label>
+                <div className="input-action-row">
+                  <input
+                    type="url"
+                    value={sampleUrl}
+                    onChange={(e) => setSampleUrl(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" && sampleUrl.trim() && !loading) handleAddSampleFromUrl();
+                    }}
+                    placeholder="https://blog.naver.com/..."
+                  />
+                  <button
+                    className="btn btn-primary btn-sm"
+                    onClick={handleAddSampleFromUrl}
+                    disabled={!sampleUrl.trim() || loading}
+                  >
+                    {loading ? <Loader2 className="spin" size={13} /> : <LinkIcon size={13} />}
+                    URL 학습
+                  </button>
+                </div>
+                <p className="field-hint">
+                  공개 네이버 블로그 글은 URL만 넣으면 본문을 가져와 말투를 분석하고 예시 글까지 만듭니다. 비공개·이웃공개 글은 「직접 붙여넣기」를 사용하세요.
+                </p>
+              </div>
+            ) : (
+              <>
+                <div className="field">
+                  <label>샘플 제목 <span style={{ fontWeight: 400 }}>(선택)</span></label>
+                  <input
+                    type="text"
+                    value={sampleTitle}
+                    onChange={(e) => setSampleTitle(e.target.value)}
+                    placeholder="예: 2026 제주 카페 후기"
+                  />
+                </div>
+                <div className="field">
+                  <label>평소에 쓴 글</label>
+                  <p className="field-hint">
+                    블로그 글을 그대로 붙여 넣으세요. 사진·캡처는 JPEG로 줄여{" "}
+                    <code>![](data:…)</code> 마크다운으로 변환돼 저장되고, 외부 URL 이미지는 링크로 남습니다.
+                  </p>
+                  <VoiceSampleEditor
+                    ref={sampleEditorRef}
+                    disabled={loading}
+                    resetKey={selectedProfileId}
+                    onMarkdownChange={setSampleMarkdown}
+                  />
+                </div>
+                <div className="flex-row" style={{ justifyContent: "flex-end", gap: 8 }}>
+                  <button className="btn btn-primary btn-sm" onClick={handleAddSample} disabled={!sampleMarkdown.trim() || loading}>
+                    {loading ? <Loader2 className="spin" size={13} /> : <Sparkles size={13} />}
+                    학습하기
+                  </button>
+                </div>
+              </>
+            )}
+
+            {loading && loadingMsg && (
+              <p className="pipeline-live-caption" style={{ marginTop: 14, display: "flex", alignItems: "center", gap: 7 }}>
+                <Loader2 className="spin" size={14} />
+                {loadingMsg}
               </p>
-              <VoiceSampleEditor
-                ref={sampleEditorRef}
-                disabled={loading}
-                resetKey={selectedProfileId}
-                onMarkdownChange={setSampleMarkdown}
-              />
-            </div>
-            <div className="flex-row" style={{ justifyContent: "flex-end", gap: 8 }}>
-              <button className="btn btn-secondary btn-sm" onClick={handleAnalyze} disabled={loading}>
-                <RefreshCw size={13} /> 다시 분석
-              </button>
-              <button className="btn btn-primary btn-sm" onClick={handleAddSample} disabled={!sampleMarkdown.trim() || loading}>
-                {loading ? <Loader2 className="spin" size={13} /> : <Sparkles size={13} />}
-                학습하기
-              </button>
-            </div>
+            )}
+            {!loading && statusMsg && (
+              <div className="alert alert-success" style={{ marginTop: 14 }}>{statusMsg}</div>
+            )}
           </div>
 
-          <div className="card tone-voice-sample-card">
-            <div className="card-title"><Sparkles size={14} /> 학습된 말투 예시 글</div>
+          <div className="card tone-voice-sample-card" ref={exampleCardRef}>
+            <div className="flex-row" style={{ justifyContent: "space-between", marginBottom: 14 }}>
+              <div className="card-title" style={{ marginBottom: 0 }}>
+                <Sparkles size={14} /> 학습된 말투 예시 글
+              </div>
+              <button
+                className="btn btn-secondary btn-sm"
+                onClick={handleAnalyze}
+                disabled={loading || (selectedProfile.sample_count ?? 0) === 0}
+              >
+                {loading ? <Loader2 className="spin" size={13} /> : <RefreshCw size={13} />}
+                {selectedProfile.example_paragraph ? "예시 다시 생성" : "예시 글 생성"}
+              </button>
+            </div>
             {selectedProfile.example_paragraph ? (
               <>
                 <p className="tone-voice-sample-lead">
@@ -2749,18 +3011,18 @@ function TonePage() {
                 </p>
                 <blockquote className="tone-voice-sample-body">{selectedProfile.example_paragraph}</blockquote>
                 <p className="tone-voice-sample-meta">
-                  Ollama가 켜져 있어야 만들어집니다. 내용이 마음에 안 들면 샘플을 더 넣고 「다시 분석」을 눌러 보세요.
+                  Ollama가 켜져 있어야 만들어집니다. 마음에 안 들면 샘플을 더 넣거나 「예시 다시 생성」을 눌러 보세요.
                 </p>
               </>
             ) : (
               <div className="text-muted tone-voice-sample-empty">
                 {(selectedProfile.sample_count ?? 0) > 0 ? (
                   <>
-                    아직 예시 글이 없습니다. Ollama가 떠 있는지 확인한 뒤 「다시 분석」을 눌러 보세요. 환경 변수 <code>VOICE_EXAMPLE_AUTOGEN</code>
-                    로 자동 생성을 끌 수 있습니다.
+                    아직 예시 글이 없습니다. Ollama가 떠 있는지 확인한 뒤 위의 「예시 글 생성」을 눌러 보세요. 환경 변수 <code>VOICE_EXAMPLE_AUTOGEN</code>
+                    으로 자동 생성을 끌 수 있습니다.
                   </>
                 ) : (
-                  <>샘플 글을 한 편 이상 추가한 뒤 「학습하기」로 저장하면, 이어서 예시 생성이 가능합니다.</>
+                  <>샘플을 한 편 이상 추가하면 학습된 말투로 쓴 예시 글이 여기에 표시됩니다.</>
                 )}
               </div>
             )}
@@ -2794,9 +3056,6 @@ function TonePage() {
 
 // ── History Page ──────────────────────────────────────────────────────────────
 
-/** 서버(UUID) 워크플로 id; 로컬 기록 깨짐 시 401/400 혼선을 줄이기 위해 검사한다 */
-const HISTORY_WORKFLOW_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
 function HistoryPage() {
   const [history, setHistory] = useState([]);
   const [selected, setSelected] = useState(null);
@@ -2811,7 +3070,13 @@ function HistoryPage() {
   const [historyQuery, setHistoryQuery] = useState("");
   const [historyStatusFilter, setHistoryStatusFilter] = useState("ALL");
   const [confirmClearHistory, setConfirmClearHistory] = useState(false);
+  const [clearingHistory, setClearingHistory] = useState(false);
+  const [deletingWorkflowId, setDeletingWorkflowId] = useState("");
+  const [confirmDeleteWorkflowId, setConfirmDeleteWorkflowId] = useState("");
+  const [listStatus, setListStatus] = useState("");
+  const [detailStatus, setDetailStatus] = useState("");
   const detailPollRef = useRef(null);
+  const detailPipelineRef = useRef(null);
   const filteredHistory = history.filter((item) => {
     const query = historyQuery.trim().toLowerCase();
     const statusOk = historyStatusFilter === "ALL" || item.status === historyStatusFilter;
@@ -2889,7 +3154,9 @@ function HistoryPage() {
   async function loadServerHistory() {
     setLoadingHistory(true);
     setHistoryError("");
+    setListStatus("");
     setConfirmClearHistory(false);
+    setConfirmDeleteWorkflowId("");
     try {
       const data = await fetchWorkflows();
       setHistory(Array.isArray(data) ? data : []);
@@ -2914,17 +3181,53 @@ function HistoryPage() {
       return;
     }
     setHistoryError("");
+    setListStatus("");
+    setClearingHistory(true);
     try {
       await deleteWorkflowHistoryApi();
       stopDetailTracking();
       clearHistory();
+      clearActiveWorkflowId();
       setHistory([]);
       setSelected(null);
       setWorkflow(null);
       setDetailError("");
       setConfirmClearHistory(false);
+      setListStatus("작업 기록을 전체 삭제했습니다.");
     } catch (e) {
       setHistoryError(e.message);
+    } finally {
+      setClearingHistory(false);
+    }
+  }
+
+  async function deleteHistoryItem(item) {
+    const workflowId = item?.workflowId ?? item?.workflow_id;
+    if (!workflowId) return;
+    if (confirmDeleteWorkflowId !== workflowId) {
+      setConfirmDeleteWorkflowId(workflowId);
+      return;
+    }
+    setDeletingWorkflowId(workflowId);
+    setHistoryError("");
+    setListStatus("");
+    try {
+      await deleteWorkflowApi(workflowId);
+      if (loadActiveWorkflowId() === workflowId) {
+        clearActiveWorkflowId();
+      }
+      setHistory((prev) => prev.filter((entry) => (entry.workflowId ?? entry.workflow_id) !== workflowId));
+      if ((selected?.workflowId ?? selected?.workflow_id) === workflowId) {
+        stopDetailTracking();
+        setSelected(null);
+        setWorkflow(null);
+      }
+      setConfirmDeleteWorkflowId("");
+      setListStatus("기록 1건을 삭제했습니다.");
+    } catch (e) {
+      setHistoryError(e.message);
+    } finally {
+      setDeletingWorkflowId("");
     }
   }
 
@@ -2933,11 +3236,12 @@ function HistoryPage() {
     setSelected(item);
     setWorkflow(null);
     setDetailError("");
+    setDetailStatus("");
     setLoadingDetail(true);
     try {
       const rawId = item.workflowId ?? item.workflow_id;
       const wid = typeof rawId === "string" ? rawId.trim() : rawId != null ? String(rawId).trim() : "";
-      if (!HISTORY_WORKFLOW_ID_RE.test(wid)) {
+      if (!WORKFLOW_ID_RE.test(wid)) {
         throw new Error("저장된 작업 ID가 올바르지 않습니다. 브라우저 작업 기록을 비우거나 새 작업부터 다시 시도해 주세요.");
       }
       const data = await fetchWorkflow(wid);
@@ -2957,11 +3261,16 @@ function HistoryPage() {
     if (!wid) return;
     setDetailBusy(true);
     setDetailError("");
+    setDetailStatus("");
     try {
       await retryWorkflowApi(wid);
       const data = await fetchWorkflow(wid);
       setWorkflow(data);
       startDetailTracking(wid);
+      setDetailStatus("재시도를 시작했습니다. 진행 상태를 확인하세요.");
+      setTimeout(() => {
+        detailPipelineRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+      }, 120);
     } catch (e) {
       setDetailError(e.message);
     } finally {
@@ -2994,6 +3303,17 @@ function HistoryPage() {
                   재시도
                 </button>
               )}
+              {workflow && (
+                <button
+                  className={`btn ${confirmDeleteWorkflowId === workflow.workflowId ? "btn-danger" : "btn-ghost"} btn-sm`}
+                  type="button"
+                  onClick={() => deleteHistoryItem(workflow)}
+                  disabled={deletingWorkflowId === workflow.workflowId}
+                >
+                  {deletingWorkflowId === workflow.workflowId ? <Loader2 className="spin" size={14} /> : <Trash2 size={14} />}
+                  {confirmDeleteWorkflowId === workflow.workflowId ? "기록 삭제 확인" : "기록 삭제"}
+                </button>
+              )}
               {workflow && <StatusPill status={workflow.status} />}
             </div>
           </div>
@@ -3006,10 +3326,11 @@ function HistoryPage() {
         )}
 
         {detailError && <div className="alert alert-error">{detailError}</div>}
+        {detailStatus && <div className="alert alert-success">{detailStatus}</div>}
 
         {workflow && (
           <>
-            <div className="card">
+            <div className="card" ref={detailPipelineRef}>
               <div className="card-title"><Activity size={14} /> 파이프라인</div>
               <PipelineSteps
                 status={workflow.status}
@@ -3092,8 +3413,10 @@ function HistoryPage() {
                 type="button"
                 className={`btn ${confirmClearHistory ? "btn-danger" : "btn-ghost"} btn-sm`}
                 onClick={clearAllHistory}
+                disabled={clearingHistory}
               >
-                <Trash2 size={14} /> {confirmClearHistory ? "정말 삭제" : "전체 삭제"}
+                {clearingHistory ? <Loader2 className="spin" size={14} /> : <Trash2 size={14} />}
+                {clearingHistory ? "삭제 중" : confirmClearHistory ? "정말 삭제" : "전체 삭제"}
               </button>
             )}
           </div>
@@ -3101,6 +3424,7 @@ function HistoryPage() {
       </div>
 
       {historyError && <div className="alert alert-error">{historyError}</div>}
+      {listStatus && <div className="alert alert-success">{listStatus}</div>}
 
       {loadingHistory ? (
         <div className="flex-row text-muted">
@@ -3151,10 +3475,18 @@ function HistoryPage() {
           ) : (
             <div className="history-list">
               {filteredHistory.map((item) => (
-                <button
+                <div
                   key={item.workflowId}
                   className="history-item"
+                  role="button"
+                  tabIndex={0}
                   onClick={() => openItem(item)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" || event.key === " ") {
+                      event.preventDefault();
+                      openItem(item);
+                    }
+                  }}
                 >
                   <div className="history-item-icon">
                     <FileText size={18} />
@@ -3166,8 +3498,24 @@ function HistoryPage() {
                       {item.groupingStrategy ? <> · {item.groupingStrategy}</> : null}
                     </div>
                   </div>
-                  <StatusPill status={item.status ?? "UNKNOWN"} />
-                </button>
+                  <div className="history-item-actions">
+                    <StatusPill status={item.status ?? "UNKNOWN"} />
+                    <button
+                      type="button"
+                      className={`history-delete-btn ${confirmDeleteWorkflowId === item.workflowId ? "confirm" : ""}`}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        deleteHistoryItem(item);
+                      }}
+                      disabled={deletingWorkflowId === item.workflowId}
+                    >
+                      {deletingWorkflowId === item.workflowId
+                        ? <Loader2 className="spin" size={13} />
+                        : <Trash2 size={13} />}
+                      <span>{confirmDeleteWorkflowId === item.workflowId ? "확인" : "삭제"}</span>
+                    </button>
+                  </div>
+                </div>
               ))}
             </div>
           )}
@@ -3433,8 +3781,55 @@ function Layout() {
   );
 }
 
+function AppErrorView({ title = "화면을 불러오지 못했습니다", detail }) {
+  return (
+    <div className="fatal-page">
+      <div className="fatal-panel">
+        <Sparkles size={24} />
+        <h2>{title}</h2>
+        <p>{detail || "잠시 후 다시 시도해 주세요. 진행 중이던 서버 작업은 작업 기록에서 다시 확인할 수 있습니다."}</p>
+        <div className="flex-row">
+          <button type="button" className="btn btn-primary" onClick={() => window.location.reload()}>
+            <RefreshCw size={15} /> 새로고침
+          </button>
+          <button type="button" className="btn btn-secondary" onClick={() => { window.location.href = "/history"; }}>
+            <FileText size={15} /> 작업 기록
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+class AppErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { error: null };
+  }
+
+  static getDerivedStateFromError(error) {
+    return { error };
+  }
+
+  componentDidCatch(error) {
+    console.error("[Momently] 화면 렌더링 오류:", error);
+  }
+
+  render() {
+    if (this.state.error) {
+      return <AppErrorView detail={this.state.error?.message} />;
+    }
+    return this.props.children;
+  }
+}
+
+function RouteErrorPage() {
+  const error = useRouteError();
+  return <AppErrorView detail={error?.message || "요청한 화면을 찾지 못했거나 라우팅 중 오류가 발생했습니다."} />;
+}
+
 const router = createBrowserRouter([
-  { path: "/login", element: <LoginPage /> },
+  { path: "/login", element: <LoginPage />, errorElement: <RouteErrorPage /> },
   {
     path: "/",
     element: (
@@ -3442,6 +3837,7 @@ const router = createBrowserRouter([
         <Layout />
       </RequireAuth>
     ),
+    errorElement: <RouteErrorPage />,
     children: [
       { index: true, element: <WritePage /> },
       { path: "tone", element: <TonePage /> },
@@ -3451,4 +3847,8 @@ const router = createBrowserRouter([
   },
 ]);
 
-createRoot(document.getElementById("root")).render(<RouterProvider router={router} />);
+createRoot(document.getElementById("root")).render(
+  <AppErrorBoundary>
+    <RouterProvider router={router} />
+  </AppErrorBoundary>
+);
