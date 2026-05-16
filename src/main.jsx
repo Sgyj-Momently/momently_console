@@ -19,6 +19,7 @@ import {
   Download,
   FileText,
   Image,
+  Link as LinkIcon,
   Loader2,
   LogOut,
   Palette,
@@ -359,8 +360,8 @@ async function uploadMultipartJson(url, formData) {
   return JSON.parse(text);
 }
 
-async function loginApi(username, password) {
-  const path = orchPath("/api/v1/auth/login");
+async function postAuthApi(pathname, payload, actionLabel) {
+  const path = orchPath(pathname);
   const resolved =
     typeof window !== "undefined" && typeof path === "string" && path.startsWith("/")
       ? `${window.location.origin}${path}`
@@ -371,10 +372,10 @@ async function loginApi(username, password) {
     response = await fetch(path, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ username, password }),
+      body: JSON.stringify(payload),
     });
   } catch (err) {
-    console.error("[Momently] 로그인 요청 실패:", resolved, err);
+    console.error(`[Momently] ${actionLabel} 요청 실패:`, resolved, err);
     const devHint = import.meta.env.DEV ? " 게이트(기본 :18580)·`vite.config.js` /api 프록시를 확인하세요." : "";
     throw new Error(
       `서버에 연결하지 못했습니다. (${resolved}) 게이트와 오케스트레이터 상태, 브라우저 네트워크 탭을 확인하세요.${devHint}`
@@ -394,6 +395,14 @@ async function loginApi(username, password) {
     throw new Error(detail || `${response.status} ${response.statusText}`);
   }
   return JSON.parse(text);
+}
+
+async function loginApi(username, password) {
+  return postAuthApi("/api/v1/auth/login", { username, password }, "로그인");
+}
+
+async function registerApi(username, password, inviteCode) {
+  return postAuthApi("/api/v1/auth/register", { username, password, inviteCode }, "회원가입");
 }
 
 async function uploadMediaApi(files) {
@@ -622,6 +631,14 @@ async function addVoiceSampleApi(profileId, title, content) {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ title, content }),
+  });
+}
+
+async function addVoiceSampleFromUrlApi(profileId, url) {
+  return apiRequest(voicePath(`/api/v1/voice-profiles/${profileId}/samples/from-url`), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ url }),
   });
 }
 
@@ -926,22 +943,34 @@ function RequireAuth({ children }) {
 
 function LoginPage() {
   const navigate = useNavigate();
+  const [authMode, setAuthMode] = useState("login");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
+  const [inviteCode, setInviteCode] = useState("");
   const [rememberLogin, setRememberLogin] = useState(false);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+
+  const isRegister = authMode === "register";
+
+  function switchMode(nextMode) {
+    setAuthMode(nextMode);
+    setError("");
+  }
 
   async function handleSubmit(e) {
     e.preventDefault();
     setBusy(true);
     setError("");
     try {
-      const data = await loginApi(username.trim(), password);
+      const trimmedUsername = username.trim();
+      const data = isRegister
+        ? await registerApi(trimmedUsername, password, inviteCode.trim())
+        : await loginApi(trimmedUsername, password);
       persistAccessToken(data.accessToken, rememberLogin);
       navigate("/", { replace: true });
     } catch (err) {
-      setError(err?.message || "로그인에 실패했습니다.");
+      setError(err?.message || (isRegister ? "회원가입에 실패했습니다." : "로그인에 실패했습니다."));
     } finally {
       setBusy(false);
     }
@@ -983,8 +1012,29 @@ function LoginPage() {
       {/* Right panel — form */}
       <div className="login-right">
         <div className="login-form-wrap">
-          <h3 className="login-form-title">콘솔 로그인</h3>
-          <p className="login-form-sub">계정 정보를 입력해 주세요</p>
+          <div className="login-mode-tabs" role="tablist" aria-label="인증 방식">
+            <button
+              type="button"
+              className={authMode === "login" ? "active" : ""}
+              onClick={() => switchMode("login")}
+              disabled={busy}
+            >
+              로그인
+            </button>
+            <button
+              type="button"
+              className={authMode === "register" ? "active" : ""}
+              onClick={() => switchMode("register")}
+              disabled={busy}
+            >
+              회원가입
+            </button>
+          </div>
+
+          <h3 className="login-form-title">{isRegister ? "콘솔 회원가입" : "콘솔 로그인"}</h3>
+          <p className="login-form-sub">
+            {isRegister ? "초대 코드를 가진 사용자만 계정을 만들 수 있어요" : "계정 정보를 입력해 주세요"}
+          </p>
 
           <form onSubmit={handleSubmit}>
             <div className="field">
@@ -1013,6 +1063,21 @@ function LoginPage() {
                 required
               />
             </div>
+            {isRegister && (
+              <div className="field">
+                <label htmlFor="login-invite">초대 코드</label>
+                <input
+                  id="login-invite"
+                  type="password"
+                  autoComplete="off"
+                  value={inviteCode}
+                  onChange={(e) => setInviteCode(e.target.value)}
+                  placeholder="초대 코드"
+                  disabled={busy}
+                  required
+                />
+              </div>
+            )}
 
             <label className="login-remember">
               <input
@@ -1032,7 +1097,7 @@ function LoginPage() {
               disabled={busy}
             >
               {busy ? <Loader2 className="spin" size={18} /> : null}
-              {busy ? "로그인 중..." : "로그인"}
+              {busy ? (isRegister ? "가입 중..." : "로그인 중...") : (isRegister ? "가입하고 시작" : "로그인")}
             </button>
           </form>
         </div>
@@ -1752,11 +1817,13 @@ function WritePage() {
   const [workflow, setWorkflow] = useState(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [startMsg, setStartMsg] = useState("");
   const [artifactKey, setArtifactKey] = useState(0);
   const [connectionMode, setConnectionMode] = useState("idle");
 
   const fileInputRef = useRef(null);
   const pollRef = useRef(null);
+  const resultCardRef = useRef(null);
 
   const allVoiceProfiles = [
     { id: "기본", name: "기본", description: "기본 warm_blog 스타일", sample_preview: "" },
@@ -1788,6 +1855,16 @@ function WritePage() {
       .then(setUploadLimits)
       .catch(() => setUploadLimits(DEFAULT_UPLOAD_LIMITS));
   }, []);
+
+  useEffect(() => {
+    if (phase === "done" && workflow?.status === "COMPLETED") {
+      const t = setTimeout(() => {
+        resultCardRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+      }, 120);
+      return () => clearTimeout(t);
+    }
+    return undefined;
+  }, [phase, workflow?.status]);
 
   function stopPolling() {
     if (pollRef.current) {
@@ -1973,11 +2050,14 @@ function WritePage() {
           return;
         }
         const thumbnails = uploadedFiles.slice();
+        setStartMsg(`사진·동영상 ${uploadedFiles.length}개 업로드 중…`);
         const up = await uploadMediaApi(uploadedFiles.map((entry) => entry.file));
         effectiveProjectId = up.projectId;
         thumbnails.forEach((item) => URL.revokeObjectURL(item.url));
         setUploadedFiles([]);
       }
+
+      setStartMsg("워크플로를 만들고 파이프라인을 실행하는 중…");
 
       const writingInstructions = [
         contentType ? `글 종류: ${contentType}` : "",
@@ -2003,6 +2083,7 @@ function WritePage() {
       setError(e.message);
     } finally {
       setBusy(false);
+      setStartMsg("");
     }
   }
 
@@ -2092,7 +2173,7 @@ function WritePage() {
 
         {phase === "done" && workflow?.status === "COMPLETED" && (
           <>
-            <div className="card">
+            <div className="card" ref={resultCardRef}>
               <div className="card-title">
                 <FileText size={14} /> 결과물
               </div>
@@ -2518,12 +2599,18 @@ function WritePage() {
             {writeStep === 3 && (photoMode === "upload" ? `${uploadedFiles.length}개 미디어로 시작` : "서버 묶음 ID로 시작")}
           </strong>
           <span>
-            {writeStep === 1 && "사진이나 동영상을 올리면 다음 단계로 갈 수 있습니다."}
-            {writeStep === 2 && "기본값으로도 충분합니다. 필요한 것만 바꾸세요."}
-            {writeStep === 3 && (
-              photoMode === "upload"
-                ? "업로드 후 자동으로 프로젝트 ID를 만들고 워크플로를 실행합니다."
-                : "입력한 서버 묶음 ID로 워크플로를 실행합니다."
+            {busy && startMsg ? (
+              <span style={{ color: "var(--brand)", fontWeight: 700 }}>{startMsg}</span>
+            ) : (
+              <>
+                {writeStep === 1 && "사진이나 동영상을 올리면 다음 단계로 갈 수 있습니다."}
+                {writeStep === 2 && "기본값으로도 충분합니다. 필요한 것만 바꾸세요."}
+                {writeStep === 3 && (
+                  photoMode === "upload"
+                    ? "업로드 후 자동으로 프로젝트 ID를 만들고 워크플로를 실행합니다."
+                    : "입력한 서버 묶음 ID로 워크플로를 실행합니다."
+                )}
+              </>
             )}
           </span>
         </div>
@@ -2567,10 +2654,15 @@ function TonePage() {
   const [formName, setFormName] = useState("");
   const [formDesc, setFormDesc] = useState("");
   const [selectedProfileId, setSelectedProfileId] = useState("");
+  const [sampleMode, setSampleMode] = useState("url");
   const [sampleTitle, setSampleTitle] = useState("");
+  const [sampleUrl, setSampleUrl] = useState("");
   const [sampleMarkdown, setSampleMarkdown] = useState("");
   const sampleEditorRef = useRef(null);
+  const exampleCardRef = useRef(null);
   const [loading, setLoading] = useState(false);
+  const [loadingMsg, setLoadingMsg] = useState("");
+  const [statusMsg, setStatusMsg] = useState("");
   const [error, setError] = useState("");
 
   const selectedProfile = profiles.find((profile) => profile.id === selectedProfileId) ?? profiles[0];
@@ -2597,7 +2689,23 @@ function TonePage() {
 
   useEffect(() => {
     setSampleMarkdown("");
+    setSampleUrl("");
+    setSampleTitle("");
+    setStatusMsg("");
+    setError("");
   }, [selectedProfileId]);
+
+  function announceLearned(updated) {
+    const hasExample = !!String(updated?.example_paragraph || "").trim();
+    setStatusMsg(
+      hasExample
+        ? "말투 학습 완료! 아래에서 학습된 말투로 쓴 예시 글을 확인하세요."
+        : "샘플은 저장됐지만 예시 글이 아직 만들어지지 않았습니다. Ollama 상태를 확인한 뒤 「예시 글 생성」을 눌러 보세요."
+    );
+    setTimeout(() => {
+      exampleCardRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+    }, 80);
+  }
 
   async function handleSave() {
     if (!formName.trim()) return;
@@ -2622,6 +2730,8 @@ function TonePage() {
     const body = sampleEditorRef.current?.getMarkdown?.()?.trim() ?? sampleMarkdown.trim();
     if (!selectedProfile || !body) return;
     setLoading(true);
+    setLoadingMsg("말투를 분석하고 예시 글을 만드는 중입니다…");
+    setStatusMsg("");
     setError("");
     try {
       const updated = await addVoiceSampleApi(selectedProfile.id, sampleTitle, body);
@@ -2629,28 +2739,56 @@ function TonePage() {
       setProfiles(next);
       saveCachedVoiceProfiles(next);
       setSampleTitle("");
+      setSampleUrl("");
       setSampleMarkdown("");
       sampleEditorRef.current?.clear?.();
+      announceLearned(updated);
     } catch (e) {
       setError(e.message);
     } finally {
       setLoading(false);
+      setLoadingMsg("");
+    }
+  }
+
+  async function handleAddSampleFromUrl() {
+    if (!selectedProfile || !sampleUrl.trim()) return;
+    setLoading(true);
+    setLoadingMsg("블로그 본문을 가져와 말투를 분석하는 중입니다…");
+    setStatusMsg("");
+    setError("");
+    try {
+      const updated = await addVoiceSampleFromUrlApi(selectedProfile.id, sampleUrl.trim());
+      const next = profiles.map((profile) => profile.id === updated.id ? updated : profile);
+      setProfiles(next);
+      saveCachedVoiceProfiles(next);
+      setSampleUrl("");
+      announceLearned(updated);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setLoading(false);
+      setLoadingMsg("");
     }
   }
 
   async function handleAnalyze() {
     if (!selectedProfile) return;
     setLoading(true);
+    setLoadingMsg("말투를 다시 분석하고 예시 글을 만드는 중입니다…");
+    setStatusMsg("");
     setError("");
     try {
       const updated = await analyzeVoiceProfileApi(selectedProfile.id);
       const next = profiles.map((profile) => profile.id === updated.id ? updated : profile);
       setProfiles(next);
       saveCachedVoiceProfiles(next);
+      announceLearned(updated);
     } catch (e) {
       setError(e.message);
     } finally {
       setLoading(false);
+      setLoadingMsg("");
     }
   }
 
@@ -2661,7 +2799,7 @@ function TonePage() {
       <div className="page-header">
         <h2>말투 학습</h2>
         <p>
-          평소에 쓴 글을 붙여 넣어 분석하면, AI가 <strong>방금 학습한 말투</strong>만 골라서 짧은 블로그 예시 글을 새로 써서 이 화면에 보여 줍니다 (가상 소재·내용입니다).
+네이버 블로그 URL을 넣거나 평소에 쓴 글을 붙여 넣으면, AI가 <strong>그 말투</strong>만 골라 짧은 예시 글을 새로 써서 바로 아래에 보여 줍니다 (가상 소재·내용입니다).
         </p>
       </div>
 
@@ -2765,42 +2903,107 @@ function TonePage() {
         <>
           <div className="card">
             <div className="card-title"><FileText size={14} /> 학습 데이터 추가</div>
-            <div className="field">
-              <label>샘플 제목</label>
-              <input
-                type="text"
-                value={sampleTitle}
-                onChange={(e) => setSampleTitle(e.target.value)}
-                placeholder="예: 2026 제주 카페 후기"
-              />
+            <div className="mode-toggle">
+              <button
+                type="button"
+                className={sampleMode === "url" ? "active" : ""}
+                onClick={() => { setSampleMode("url"); setStatusMsg(""); }}
+              >
+                URL로 가져오기
+              </button>
+              <button
+                type="button"
+                className={sampleMode === "paste" ? "active" : ""}
+                onClick={() => { setSampleMode("paste"); setStatusMsg(""); }}
+              >
+                직접 붙여넣기
+              </button>
             </div>
-            <div className="field">
-              <label>평소에 쓴 글</label>
-              <p className="field-hint">
-                TipTap 에디터에서 블로그 글을 붙여 넣을 수 있습니다. 사진·캡처는 JPEG로 줄여{" "}
-                <code>![](data:…)</code> 마크다운으로 변환된 뒤 서버에 저장됩니다. 외부 URL 이미지는 그대로 링크로
-                남습니다.
+
+            {sampleMode === "url" ? (
+              <div className="field" style={{ marginBottom: 0 }}>
+                <label>네이버 블로그 URL</label>
+                <div className="input-action-row">
+                  <input
+                    type="url"
+                    value={sampleUrl}
+                    onChange={(e) => setSampleUrl(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" && sampleUrl.trim() && !loading) handleAddSampleFromUrl();
+                    }}
+                    placeholder="https://blog.naver.com/..."
+                  />
+                  <button
+                    className="btn btn-primary btn-sm"
+                    onClick={handleAddSampleFromUrl}
+                    disabled={!sampleUrl.trim() || loading}
+                  >
+                    {loading ? <Loader2 className="spin" size={13} /> : <LinkIcon size={13} />}
+                    URL 학습
+                  </button>
+                </div>
+                <p className="field-hint">
+                  공개 네이버 블로그 글은 URL만 넣으면 본문을 가져와 말투를 분석하고 예시 글까지 만듭니다. 비공개·이웃공개 글은 「직접 붙여넣기」를 사용하세요.
+                </p>
+              </div>
+            ) : (
+              <>
+                <div className="field">
+                  <label>샘플 제목 <span style={{ fontWeight: 400 }}>(선택)</span></label>
+                  <input
+                    type="text"
+                    value={sampleTitle}
+                    onChange={(e) => setSampleTitle(e.target.value)}
+                    placeholder="예: 2026 제주 카페 후기"
+                  />
+                </div>
+                <div className="field">
+                  <label>평소에 쓴 글</label>
+                  <p className="field-hint">
+                    블로그 글을 그대로 붙여 넣으세요. 사진·캡처는 JPEG로 줄여{" "}
+                    <code>![](data:…)</code> 마크다운으로 변환돼 저장되고, 외부 URL 이미지는 링크로 남습니다.
+                  </p>
+                  <VoiceSampleEditor
+                    ref={sampleEditorRef}
+                    disabled={loading}
+                    resetKey={selectedProfileId}
+                    onMarkdownChange={setSampleMarkdown}
+                  />
+                </div>
+                <div className="flex-row" style={{ justifyContent: "flex-end", gap: 8 }}>
+                  <button className="btn btn-primary btn-sm" onClick={handleAddSample} disabled={!sampleMarkdown.trim() || loading}>
+                    {loading ? <Loader2 className="spin" size={13} /> : <Sparkles size={13} />}
+                    학습하기
+                  </button>
+                </div>
+              </>
+            )}
+
+            {loading && loadingMsg && (
+              <p className="pipeline-live-caption" style={{ marginTop: 14, display: "flex", alignItems: "center", gap: 7 }}>
+                <Loader2 className="spin" size={14} />
+                {loadingMsg}
               </p>
-              <VoiceSampleEditor
-                ref={sampleEditorRef}
-                disabled={loading}
-                resetKey={selectedProfileId}
-                onMarkdownChange={setSampleMarkdown}
-              />
-            </div>
-            <div className="flex-row" style={{ justifyContent: "flex-end", gap: 8 }}>
-              <button className="btn btn-secondary btn-sm" onClick={handleAnalyze} disabled={loading}>
-                <RefreshCw size={13} /> 다시 분석
-              </button>
-              <button className="btn btn-primary btn-sm" onClick={handleAddSample} disabled={!sampleMarkdown.trim() || loading}>
-                {loading ? <Loader2 className="spin" size={13} /> : <Sparkles size={13} />}
-                학습하기
-              </button>
-            </div>
+            )}
+            {!loading && statusMsg && (
+              <div className="alert alert-success" style={{ marginTop: 14 }}>{statusMsg}</div>
+            )}
           </div>
 
-          <div className="card tone-voice-sample-card">
-            <div className="card-title"><Sparkles size={14} /> 학습된 말투 예시 글</div>
+          <div className="card tone-voice-sample-card" ref={exampleCardRef}>
+            <div className="flex-row" style={{ justifyContent: "space-between", marginBottom: 14 }}>
+              <div className="card-title" style={{ marginBottom: 0 }}>
+                <Sparkles size={14} /> 학습된 말투 예시 글
+              </div>
+              <button
+                className="btn btn-secondary btn-sm"
+                onClick={handleAnalyze}
+                disabled={loading || (selectedProfile.sample_count ?? 0) === 0}
+              >
+                {loading ? <Loader2 className="spin" size={13} /> : <RefreshCw size={13} />}
+                {selectedProfile.example_paragraph ? "예시 다시 생성" : "예시 글 생성"}
+              </button>
+            </div>
             {selectedProfile.example_paragraph ? (
               <>
                 <p className="tone-voice-sample-lead">
@@ -2808,18 +3011,18 @@ function TonePage() {
                 </p>
                 <blockquote className="tone-voice-sample-body">{selectedProfile.example_paragraph}</blockquote>
                 <p className="tone-voice-sample-meta">
-                  Ollama가 켜져 있어야 만들어집니다. 내용이 마음에 안 들면 샘플을 더 넣고 「다시 분석」을 눌러 보세요.
+                  Ollama가 켜져 있어야 만들어집니다. 마음에 안 들면 샘플을 더 넣거나 「예시 다시 생성」을 눌러 보세요.
                 </p>
               </>
             ) : (
               <div className="text-muted tone-voice-sample-empty">
                 {(selectedProfile.sample_count ?? 0) > 0 ? (
                   <>
-                    아직 예시 글이 없습니다. Ollama가 떠 있는지 확인한 뒤 「다시 분석」을 눌러 보세요. 환경 변수 <code>VOICE_EXAMPLE_AUTOGEN</code>
-                    로 자동 생성을 끌 수 있습니다.
+                    아직 예시 글이 없습니다. Ollama가 떠 있는지 확인한 뒤 위의 「예시 글 생성」을 눌러 보세요. 환경 변수 <code>VOICE_EXAMPLE_AUTOGEN</code>
+                    으로 자동 생성을 끌 수 있습니다.
                   </>
                 ) : (
-                  <>샘플 글을 한 편 이상 추가한 뒤 「학습하기」로 저장하면, 이어서 예시 생성이 가능합니다.</>
+                  <>샘플을 한 편 이상 추가하면 학습된 말투로 쓴 예시 글이 여기에 표시됩니다.</>
                 )}
               </div>
             )}
@@ -2870,7 +3073,10 @@ function HistoryPage() {
   const [clearingHistory, setClearingHistory] = useState(false);
   const [deletingWorkflowId, setDeletingWorkflowId] = useState("");
   const [confirmDeleteWorkflowId, setConfirmDeleteWorkflowId] = useState("");
+  const [listStatus, setListStatus] = useState("");
+  const [detailStatus, setDetailStatus] = useState("");
   const detailPollRef = useRef(null);
+  const detailPipelineRef = useRef(null);
   const filteredHistory = history.filter((item) => {
     const query = historyQuery.trim().toLowerCase();
     const statusOk = historyStatusFilter === "ALL" || item.status === historyStatusFilter;
@@ -2948,6 +3154,7 @@ function HistoryPage() {
   async function loadServerHistory() {
     setLoadingHistory(true);
     setHistoryError("");
+    setListStatus("");
     setConfirmClearHistory(false);
     setConfirmDeleteWorkflowId("");
     try {
@@ -2974,6 +3181,7 @@ function HistoryPage() {
       return;
     }
     setHistoryError("");
+    setListStatus("");
     setClearingHistory(true);
     try {
       await deleteWorkflowHistoryApi();
@@ -2985,6 +3193,7 @@ function HistoryPage() {
       setWorkflow(null);
       setDetailError("");
       setConfirmClearHistory(false);
+      setListStatus("작업 기록을 전체 삭제했습니다.");
     } catch (e) {
       setHistoryError(e.message);
     } finally {
@@ -3001,6 +3210,7 @@ function HistoryPage() {
     }
     setDeletingWorkflowId(workflowId);
     setHistoryError("");
+    setListStatus("");
     try {
       await deleteWorkflowApi(workflowId);
       if (loadActiveWorkflowId() === workflowId) {
@@ -3013,6 +3223,7 @@ function HistoryPage() {
         setWorkflow(null);
       }
       setConfirmDeleteWorkflowId("");
+      setListStatus("기록 1건을 삭제했습니다.");
     } catch (e) {
       setHistoryError(e.message);
     } finally {
@@ -3025,6 +3236,7 @@ function HistoryPage() {
     setSelected(item);
     setWorkflow(null);
     setDetailError("");
+    setDetailStatus("");
     setLoadingDetail(true);
     try {
       const rawId = item.workflowId ?? item.workflow_id;
@@ -3049,11 +3261,16 @@ function HistoryPage() {
     if (!wid) return;
     setDetailBusy(true);
     setDetailError("");
+    setDetailStatus("");
     try {
       await retryWorkflowApi(wid);
       const data = await fetchWorkflow(wid);
       setWorkflow(data);
       startDetailTracking(wid);
+      setDetailStatus("재시도를 시작했습니다. 진행 상태를 확인하세요.");
+      setTimeout(() => {
+        detailPipelineRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+      }, 120);
     } catch (e) {
       setDetailError(e.message);
     } finally {
@@ -3109,10 +3326,11 @@ function HistoryPage() {
         )}
 
         {detailError && <div className="alert alert-error">{detailError}</div>}
+        {detailStatus && <div className="alert alert-success">{detailStatus}</div>}
 
         {workflow && (
           <>
-            <div className="card">
+            <div className="card" ref={detailPipelineRef}>
               <div className="card-title"><Activity size={14} /> 파이프라인</div>
               <PipelineSteps
                 status={workflow.status}
@@ -3206,6 +3424,7 @@ function HistoryPage() {
       </div>
 
       {historyError && <div className="alert alert-error">{historyError}</div>}
+      {listStatus && <div className="alert alert-success">{listStatus}</div>}
 
       {loadingHistory ? (
         <div className="flex-row text-muted">

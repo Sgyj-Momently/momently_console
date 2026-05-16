@@ -377,6 +377,7 @@ a.nav-item.active {
 input[type="text"],
 input[type="number"],
 input[type="password"],
+input[type="url"],
 select,
 textarea {
   background: #FFFFFF;
@@ -391,8 +392,19 @@ textarea {
 input[type="text"],
 input[type="number"],
 input[type="password"],
+input[type="url"],
 select {
   height: 38px;
+}
+
+.input-action-row {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.input-action-row .btn {
+  white-space: nowrap;
 }
 
 textarea {
@@ -2244,6 +2256,39 @@ input:-webkit-autofill:active {
   width: 100%;
 }
 
+.login-mode-tabs {
+  background: var(--surface-subtle);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px;
+  margin-bottom: 24px;
+  padding: 4px;
+}
+
+.login-mode-tabs button {
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 700;
+  height: 34px;
+}
+
+.login-mode-tabs button.active {
+  background: var(--surface);
+  box-shadow: 0 1px 3px rgba(15, 23, 42, 0.12);
+  color: var(--text);
+}
+
+.login-mode-tabs button:disabled {
+  cursor: not-allowed;
+  opacity: 0.7;
+}
+
 .login-form-title {
   color: var(--text);
   font-size: 24px;
@@ -2421,6 +2466,10 @@ input:-webkit-autofill:active {
 
   .start-panel .btn {
     width: 100%;
+  }
+
+  .input-action-row {
+    grid-template-columns: 1fr;
   }
 
   .write-hero {
